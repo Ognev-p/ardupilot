@@ -639,6 +639,7 @@ struct PACKED Packed_Location_Option_Flags {
     uint8_t terrain_alt  : 1;           // this altitude is above terrain
     uint8_t origin_alt   : 1;           // this altitude is above ekf origin
     uint8_t loiter_xtrack : 1;          // 0 to crosstrack from center of waypoint, 1 to crosstrack from tangent exit location
+    uint8_t type_specific_bit_0 : 1;    // each mission item type can use this for storing 1 bit of extra data
 };
 
 struct PACKED PackedLocation {
@@ -724,6 +725,10 @@ bool AP_Mission::read_cmd_from_storage(uint16_t index, Mission_Command& cmd) con
         cmd.content.location.alt = packed_content.location.alt;
         cmd.content.location.lat = packed_content.location.lat;
         cmd.content.location.lng = packed_content.location.lng;
+
+        if (packed_content.location.flags.type_specific_bit_0) {
+            cmd.type_specific_bits = 1U << 0;
+        }
     } else {
         // all other options in Content are assumed to be packed:
         static_assert(sizeof(cmd.content) >= 12,
@@ -785,6 +790,7 @@ bool AP_Mission::write_cmd_to_storage(uint16_t index, const Mission_Command& cmd
         packed.location.flags.terrain_alt = cmd.content.location.terrain_alt;
         packed.location.flags.origin_alt = cmd.content.location.origin_alt;
         packed.location.flags.loiter_xtrack = cmd.content.location.loiter_xtrack;
+        packed.location.flags.type_specific_bit_0 = cmd.type_specific_bits & (1U<<0);
         packed.location.alt = cmd.content.location.alt;
         packed.location.lat = cmd.content.location.lat;
         packed.location.lng = cmd.content.location.lng;
@@ -920,9 +926,20 @@ MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_
         break;
 
     case MAV_CMD_NAV_LOITER_TURNS: {                    // MAV ID: 18
-        uint16_t num_turns = packet.param1;              // param 1 is number of times to circle is held in low p1
-        uint16_t radius_m = fabsf(packet.param3);        // param 3 is radius in meters is held in high p1
-        cmd.p1 = (radius_m<<8) | (num_turns & 0x00FF);   // store radius in high byte of p1, num turns in low byte of p1
+        // number of turns is stored in the lowest bits.  radii below
+        // 255m are stored in the top 8 bits as an 8-bit integer.
+        // Radii above 255m are stored divided by 10 and a bit set in
+        // storage so that on retrieval they are multiplied by 10
+        cmd.p1 = MIN(255, packet.param1); // store number of times to circle in low p1
+        uint8_t radius_m;
+        const float abs_radius = fabsf(packet.param3);
+        if (abs_radius <= 255) {
+            radius_m = abs_radius;
+        } else {
+            radius_m = MIN(255, abs_radius * 0.1);
+            cmd.type_specific_bits = 1U << 0;
+        }
+        cmd.p1 |= (radius_m<<8);   // store radius in high byte of p1
         cmd.content.location.loiter_ccw = (packet.param3 < 0);
         cmd.content.location.loiter_xtrack = (packet.param4 > 0); // 0 to xtrack from center of waypoint, 1 to xtrack from tangent exit location
     }
@@ -1388,6 +1405,9 @@ bool AP_Mission::mission_cmd_to_mavlink_int(const AP_Mission::Mission_Command& c
         if (cmd.content.location.loiter_ccw) {
             packet.param3 = -packet.param3;
         }
+        if (cmd.type_specific_bits & (1U<<0)) {
+            packet.param3 *= 10;
+        }
         packet.param4 = cmd.content.location.loiter_xtrack; // 0 to xtrack from center of waypoint, 1 to xtrack from tangent exit location
         break;
 
@@ -1648,7 +1668,7 @@ bool AP_Mission::mission_cmd_to_mavlink_int(const AP_Mission::Mission_Command& c
         packet.x = cmd.content.location.lat;
         packet.y = cmd.content.location.lng;
 
-        packet.z = cmd.content.location.alt / 100.0f;   // cmd alt in cm to m
+        packet.z = cmd.content.location.alt * 0.01f;   // cmd alt in cm to m
         if (cmd.content.location.relative_alt) {
             packet.frame = MAV_FRAME_GLOBAL_RELATIVE_ALT;
         } else {
@@ -2027,7 +2047,7 @@ uint16_t AP_Mission::get_landing_sequence_start()
 {
     struct Location current_loc;
 
-    if (!AP::ahrs().get_position(current_loc)) {
+    if (!AP::ahrs().get_location(current_loc)) {
         return 0;
     }
 
@@ -2086,7 +2106,7 @@ bool AP_Mission::jump_to_abort_landing_sequence(void)
     struct Location current_loc;
 
     uint16_t abort_index = 0;
-    if (AP::ahrs().get_position(current_loc)) {
+    if (AP::ahrs().get_location(current_loc)) {
         float min_distance = FLT_MAX;
 
         for (uint16_t i = 1; i < num_commands(); i++) {
@@ -2153,7 +2173,7 @@ bool AP_Mission::is_best_land_sequence(void)
 
     // get our current location
     Location current_loc;
-    if (!AP::ahrs().get_position(current_loc)) {
+    if (!AP::ahrs().get_location(current_loc)) {
         // we don't know where we are!!
         return false;
     }
@@ -2397,7 +2417,7 @@ void AP_Mission::reset_wp_history(void)
 // store the latest reported position incase of mission exit and rewind resume
 void AP_Mission::update_exit_position(void)
 {
-    if (!AP::ahrs().get_position(_exit_position)) {
+    if (!AP::ahrs().get_location(_exit_position)) {
         _exit_position.lat = 0;
         _exit_position.lng = 0;
     }

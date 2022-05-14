@@ -11,7 +11,8 @@ void AP_Arming_Copter::update(void)
     static uint8_t pre_arm_display_counter = PREARM_DISPLAY_PERIOD/2;
     pre_arm_display_counter++;
     bool display_fail = false;
-    if (pre_arm_display_counter >= PREARM_DISPLAY_PERIOD) {
+    if ((_arming_options & uint32_t(AP_Arming::ArmingOptions::DISABLE_PREARM_DISPLAY)) == 0 &&
+        pre_arm_display_counter >= PREARM_DISPLAY_PERIOD) {
         display_fail = true;
         pre_arm_display_counter = 0;
     }
@@ -45,10 +46,20 @@ bool AP_Arming_Copter::run_pre_arm_checks(bool display_failure)
 
     // check if motor interlock aux switch is in use
     // if it is, switch needs to be in disabled position to arm
-    // otherwise exit immediately.  This check to be repeated,
-    // as state can change at any time.
+    // otherwise exit immediately.
     if (copter.ap.using_interlock && copter.ap.motor_interlock_switch) {
         check_failed(display_failure, "Motor Interlock Enabled");
+        return false;
+    }
+
+    // if we are using motor Estop switch, it must not be in Estop position
+    if (SRV_Channels::get_emergency_stop()){
+        check_failed(display_failure, "Motor Emergency Stopped");
+        return false;
+    }
+
+    if (!disarm_switch_checks(display_failure)) {
+        return false;
     }
 
     // if pre arm checks are disabled run only the mandatory checks
@@ -58,11 +69,13 @@ bool AP_Arming_Copter::run_pre_arm_checks(bool display_failure)
 
     return parameter_checks(display_failure)
         & motor_checks(display_failure)
-        & pilot_throttle_checks(display_failure)
         & oa_checks(display_failure)
         & gcs_failsafe_check(display_failure)
         & winch_checks(display_failure)
         & alt_checks(display_failure)
+#if AP_AIRSPEED_ENABLED
+        & AP_Arming::airspeed_checks(display_failure)
+#endif
         & AP_Arming::pre_arm_checks(display_failure);
 }
 
@@ -340,25 +353,6 @@ bool AP_Arming_Copter::motor_checks(bool display_failure)
         }
     }
 #endif
-
-    return true;
-}
-
-bool AP_Arming_Copter::pilot_throttle_checks(bool display_failure)
-{
-    // check throttle is above failsafe throttle
-    // this is near the bottom to allow other failures to be displayed before checking pilot throttle
-    if ((checks_to_perform == ARMING_CHECK_ALL) || (checks_to_perform & ARMING_CHECK_RC)) {
-        if (copter.g.failsafe_throttle != FS_THR_DISABLED && copter.channel_throttle->get_radio_in() < copter.g.failsafe_throttle_value) {
-            #if FRAME_CONFIG == HELI_FRAME
-            const char *failmsg = "Collective below Failsafe";
-            #else
-            const char *failmsg = "Throttle below Failsafe";
-            #endif
-            check_failed(ARMING_CHECK_RC, display_failure, "%s", failmsg);
-            return false;
-        }
-    }
 
     return true;
 }
@@ -649,23 +643,6 @@ bool AP_Arming_Copter::arm_checks(AP_Arming::Method method)
 
     // always check motors
     if (!motor_checks(true)) {
-        return false;
-    }
-
-    // if we are using motor interlock switch and it's enabled, fail to arm
-    // skip check in Throw mode which takes control of the motor interlock
-    if (copter.ap.using_interlock && copter.ap.motor_interlock_switch) {
-        check_failed(true, "Motor Interlock Enabled");
-        return false;
-    }
-
-    // if we are not using Emergency Stop switch option, force Estop false to ensure motors
-    // can run normally
-    if (!rc().find_channel_for_option(RC_Channel::AUX_FUNC::MOTOR_ESTOP)){
-        SRV_Channels::set_emergency_stop(false);
-        // if we are using motor Estop switch, it must not be in Estop position
-    } else if (SRV_Channels::get_emergency_stop()){
-        check_failed(true, "Motor Emergency Stopped");
         return false;
     }
 

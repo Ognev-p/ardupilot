@@ -85,8 +85,8 @@ public:
       wrappers around ahrs functions which pass-thru directly. See
       AP_AHRS.h for description of each function
      */
-    bool get_position(struct Location &loc) const WARN_IF_UNUSED {
-        return ahrs.get_position(loc);
+    bool get_location(struct Location &loc) const WARN_IF_UNUSED {
+        return ahrs.get_location(loc);
     }
 
     Vector3f wind_estimate(void) {
@@ -187,9 +187,13 @@ public:
 
 
     // get current rotation
+    // note that this may not be the rotation were actually using, see _pitch_trim_deg
     enum Rotation get_rotation(void) const {
         return rotation;
     }
+
+    // get pitch trim (deg)
+    float get_pitch_trim() const { return _pitch_trim_deg; }
 
 private:
     const enum Rotation rotation;

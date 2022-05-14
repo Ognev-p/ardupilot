@@ -231,7 +231,9 @@ void AP_MotorsHeli::output()
     } else {
         output_disarmed();
     }
-    
+
+    update_turbine_start();
+
     output_to_motors();
 
 };
@@ -454,7 +456,7 @@ void AP_MotorsHeli::output_logic()
 bool AP_MotorsHeli::parameter_check(bool display_msg) const
 {
     // returns false if RSC Mode is not set to a valid control mode
-    if (_main_rotor._rsc_mode.get() <= (int8_t)ROTOR_CONTROL_MODE_DISABLED || _main_rotor._rsc_mode.get() > (int8_t)ROTOR_CONTROL_MODE_CLOSED_LOOP_POWER_OUTPUT) {
+    if (_main_rotor._rsc_mode.get() <= (int8_t)ROTOR_CONTROL_MODE_DISABLED || _main_rotor._rsc_mode.get() > (int8_t)ROTOR_CONTROL_MODE_AUTOTHROTTLE) {
         if (display_msg) {
             gcs().send_text(MAV_SEVERITY_CRITICAL, "PreArm: H_RSC_MODE invalid");
         }
@@ -595,5 +597,15 @@ void AP_MotorsHeli::update_takeoff_collective_flag(float coll_out)
 bool AP_MotorsHeli::heli_option(HeliOption opt) const
 {
     return (_heli_options & (uint8_t)opt);
+}
+
+// updates the turbine start flag
+void AP_MotorsHeli::update_turbine_start()
+{
+    if (_heliflags.start_engine) {
+        _main_rotor.set_turbine_start(true);
+    } else {
+        _main_rotor.set_turbine_start(false);
+    }
 }
 

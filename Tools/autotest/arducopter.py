@@ -32,7 +32,6 @@ from pymavlink.rotmat import Vector3
 testdir = os.path.dirname(os.path.realpath(__file__))
 SITL_START_LOCATION = mavutil.location(-35.362938, 149.165085, 584, 270)
 
-
 # Flight mode switch positions are set-up in arducopter.param to be
 #   switch 1 = Circle
 #   switch 2 = Land
@@ -61,7 +60,7 @@ class AutoTestCopter(AutoTest):
 
     @staticmethod
     def get_normal_armable_modes_list():
-        return ["ACRO", "ALT_HOLD", "SPORT", "STABILIZE", "GUIDED_NOGPS"]
+        return ["ACRO", "ALT_HOLD", "STABILIZE", "GUIDED_NOGPS"]
 
     def log_name(self):
         return "ArduCopter"
@@ -1094,6 +1093,126 @@ class AutoTestCopter(AutoTest):
         self.context_pop()
         self.reboot_sitl()
 
+    def assert_dataflash_message_field_level_at(self,
+                                                mtype,
+                                                field,
+                                                level,
+                                                maintain=1,
+                                                tolerance=0.05,
+                                                timeout=30,
+                                                condition=None,
+                                                dfreader_start_timestamp=None,
+                                                verbose=False):
+        '''wait for EKF's accel bias to reach a level and maintain it'''
+
+        if verbose:
+            self.progress("current onboard log filepath: %s" % self.current_onboard_log_filepath())
+        dfreader = self.dfreader_for_current_onboard_log()
+
+        achieve_start = None
+        current_value = None
+        while True:
+            m = dfreader.recv_match(type=mtype, condition=condition)
+            if m is None:
+                raise NotAchievedException("%s.%s did not maintain %f" %
+                                           (mtype, field, level))
+            if dfreader_start_timestamp is not None:
+                if m.TimeUS < dfreader_start_timestamp:
+                    continue
+            if verbose:
+                print("m=%s" % str(m))
+            current_value = getattr(m, field)
+
+            if abs(current_value - level) > tolerance:
+                if achieve_start is not None:
+                    self.progress("Achieve stop at %u" % m.TimeUS)
+                    achieve_start = None
+                continue
+
+            dfreader_now = m.TimeUS
+            if achieve_start is None:
+                self.progress("Achieve start at %u (got=%f want=%f)" %
+                              (dfreader_now, current_value, level))
+                if maintain is None:
+                    return
+                achieve_start = m.TimeUS
+                continue
+
+            # we're achieving....
+            if dfreader_now - achieve_start > maintain*1e6:
+                return dfreader_now
+
+    # Tests any EK3 accel bias is subtracted from the correct IMU data
+    def EK3AccelBias(self):
+
+        self.context_push()
+
+        self.start_test("Test zero bias")
+        dfreader_tstart = self.assert_dataflash_message_field_level_at(
+            "XKF2",
+            "AZ",
+            0.0,
+            condition="XKF2.C==1",
+        )
+
+        # Add 2m/s/s bias to the second IMU
+        self.set_parameters({
+            'SIM_ACC2_BIAS_Z': 0.7,
+        })
+
+        self.start_subtest("Ensuring second core has bias")
+        self.delay_sim_time(30)
+        dfreader_tstart = self.assert_dataflash_message_field_level_at(
+            "XKF2", "AZ", 0.7,
+            condition="XKF2.C==1",
+        )
+
+        self.start_subtest("Ensuring earth frame is compensated")
+        self.assert_dataflash_message_field_level_at(
+            "RATE", "A", 0,
+            maintain=1,
+            tolerance=2,    # RATE.A is in cm/s/s
+            dfreader_start_timestamp=dfreader_tstart,
+        )
+
+        # now switch the EKF to only using the second core:
+        self.set_parameters({
+            'SIM_ACC2_BIAS_Z': 0.0,
+            "EK3_IMU_MASK": 0b10,
+        })
+        self.reboot_sitl()
+
+        self.delay_sim_time(30)
+        dfreader_tstart = self.assert_dataflash_message_field_level_at(
+            "XKF2", "AZ", 0.0,
+            condition="XKF2.C==0",
+        )
+
+        # Add 2m/s/s bias to the second IMU
+        self.set_parameters({
+            'SIM_ACC2_BIAS_Z': 0.7,
+        })
+
+        self.start_subtest("Ensuring first core now has bias")
+        self.delay_sim_time(30)
+        dfreader_tstart = self.assert_dataflash_message_field_level_at(
+            "XKF2", "AZ", 0.7,
+            condition="XKF2.C==0",
+        )
+
+        self.start_subtest("Ensuring earth frame is compensated")
+        self.assert_dataflash_message_field_level_at(
+            "RATE", "A", 0,
+            maintain=1,
+            tolerance=2,  # RATE.A is in cm/s/s
+            dfreader_start_timestamp=dfreader_tstart,
+            verbose=True,
+        )
+
+        # revert simulated accel bias and reboot to restore EKF health
+        self.context_pop()
+        self.reboot_sitl()
+
     # fly_stability_patch - fly south, then hold loiter within 5m
     # position and altitude and reduce 1 motor to 60% efficiency
     def fly_stability_patch(self,
@@ -1230,45 +1349,6 @@ class AutoTestCopter(AutoTest):
         self.fly_fence_avoid_test_radius_check(avoid_behave=1, timeout=timeout)
         self.fly_fence_avoid_test_radius_check(avoid_behave=0, timeout=timeout)
 
-    def assert_prearm_failure(self, expected_statustext, timeout=5, ignore_prearm_failures=[]):
-        seen_statustext = False
-        seen_command_ack = False
-
-        self.drain_mav()
-        tstart = self.get_sim_time_cached()
-        arm_last_send = 0
-        while True:
-            if seen_command_ack and seen_statustext:
-                break
-            now = self.get_sim_time_cached()
-            if now - tstart > timeout:
-                raise NotAchievedException(
-                    "Did not see failure-to-arm messages (statustext=%s command_ack=%s" %
-                    (seen_statustext, seen_command_ack))
-            if now - arm_last_send > 1:
-                arm_last_send = now
-                self.send_mavlink_arm_command()
-            m = self.mav.recv_match(blocking=True, timeout=1)
-            if m is None:
-                continue
-            if m.get_type() == "STATUSTEXT":
-                if expected_statustext in m.text:
-                    self.progress("Got: %s" % str(m))
-                    seen_statustext = True
-                elif "PreArm" in m.text and m.text[8:] not in ignore_prearm_failures:
-                    self.progress("Got: %s" % str(m))
-                    raise NotAchievedException("Unexpected prearm failure (%s)" % m.text)
-
-            if m.get_type() == "COMMAND_ACK":
-                print("Got: %s" % str(m))
-                if m.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
-                    if m.result != 4:
-                        raise NotAchievedException("command-ack says we didn't fail to arm")
-                    self.progress("Got: %s" % str(m))
-                    seen_command_ack = True
-            if self.mav.motors_armed():
-                raise NotAchievedException("Armed when we shouldn't have")
-
     # fly_fence_test - fly east until you hit the horizontal circular fence
     def fly_fence_test(self, timeout=180):
         # enable fence, disable avoidance
@@ -1281,10 +1361,7 @@ class AutoTestCopter(AutoTest):
         self.wait_ready_to_arm()
 
         # fence requires home to be set:
-        m = self.poll_home_position()
-        if m is None:
-            raise NotAchievedException("Did not receive HOME_POSITION")
-        self.progress("home: %s" % str(m))
+        m = self.poll_home_position(quiet=False)
 
         self.start_subtest("ensure we can't arm if outside fence")
         self.load_fence("fence-in-middle-of-nowhere.txt")
@@ -2039,6 +2116,89 @@ class AutoTestCopter(AutoTest):
         if ex is not None:
             raise ex
 
+    # fly_optical_flow_calibration - test optical flow calibration
+    def fly_optical_flow_calibration(self):
+        ex = None
+        self.context_push()
+        try:
+
+            self.set_parameter("SIM_FLOW_ENABLE", 1)
+            self.set_parameter("FLOW_TYPE", 10)
+            self.set_analog_rangefinder_parameters()
+
+            # RC9 starts/stops calibration
+            self.set_parameter("RC9_OPTION", 158)
+
+            # initialise flow scaling parameters to incorrect values
+            self.set_parameter("FLOW_FXSCALER", -200)
+            self.set_parameter("FLOW_FYSCALER", 200)
+
+            self.reboot_sitl()
+
+            # ensure calibration is off
+            self.set_rc(9, 1000)
+
+            # takeoff to 10m in loiter
+            self.takeoff(10, mode="LOITER", require_absolute=True, timeout=720)
+
+            # start calibration
+            self.set_rc(9, 2000)
+
+            tstart = self.get_sim_time()
+            timeout = 90
+            veh_dir_tstart = self.get_sim_time()
+            veh_dir = 0
+            while self.get_sim_time_cached() - tstart < timeout:
+                # roll and pitch vehicle until samples collected
+                # change direction of movement every 2 seconds
+                if self.get_sim_time_cached() - veh_dir_tstart > 2:
+                    veh_dir_tstart = self.get_sim_time()
+                    veh_dir = veh_dir + 1
+                    if veh_dir > 3:
+                        veh_dir = 0
+                if veh_dir == 0:
+                    # move right
+                    self.set_rc(1, 1800)
+                    self.set_rc(2, 1500)
+                if veh_dir == 1:
+                    # move left
+                    self.set_rc(1, 1200)
+                    self.set_rc(2, 1500)
+                if veh_dir == 2:
+                    # move forward
+                    self.set_rc(1, 1500)
+                    self.set_rc(2, 1200)
+                if veh_dir == 3:
+                    # move back
+                    self.set_rc(1, 1500)
+                    self.set_rc(2, 1800)
+
+            # return sticks to center
+            self.set_rc(1, 1500)
+            self.set_rc(2, 1500)
+
+            # stop calibration (not actually necessary)
+            self.set_rc(9, 1000)
+
+            # check scaling parameters have been restored to values near zero
+            flow_scalar_x = self.get_parameter("FLOW_FXSCALER")
+            flow_scalar_y = self.get_parameter("FLOW_FYSCALER")
+            if ((flow_scalar_x > 30) or (flow_scalar_x < -30)):
+                raise NotAchievedException("FlowCal failed to set FLOW_FXSCALER correctly")
+            if ((flow_scalar_y > 30) or (flow_scalar_y < -30)):
+                raise NotAchievedException("FlowCal failed to set FLOW_FYSCALER correctly")
+
+        except Exception as e:
+            self.print_exception_caught(e)
+            ex = e
+
+        self.context_pop()
+        self.disarm_vehicle(force=True)
+        self.reboot_sitl()
+
+        if ex is not None:
+            raise ex
+
     def fly_autotune(self):
         """Test autotune mode"""
 
@@ -2304,6 +2464,52 @@ class AutoTestCopter(AutoTest):
         self.context_pop()
         self.fly_auto_test()
 
+    # test takeoff altitude
+    def test_takeoff_alt(self):
+        # Test case #1 (set target altitude to relative -10m from the ground, -10m is invalid, so it is set to 1m)
+        self.progress("Testing relative alt from the ground")
+        self.do_takeoff_alt("copter_takeoff.txt", 1, False)
+        # Test case #2 (set target altitude to relative -10m during flight, -10m is invalid, so keeps current altitude)
+        self.progress("Testing relative alt during flight")
+        self.do_takeoff_alt("copter_takeoff.txt", 10, True)
+
+        self.progress("Takeoff mission completed: passed!")
+
+    def do_takeoff_alt(self, mission_file, target_alt, during_flight=False):
+        self.progress("# Load %s" % mission_file)
+        # load the waypoint count
+        num_wp = self.load_mission(mission_file, strict=False)
+        if not num_wp:
+            raise NotAchievedException("load %s failed" % mission_file)
+
+        self.set_current_waypoint(1)
+
+        self.change_mode("GUIDED")
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+
+        if during_flight:
+            self.user_takeoff(alt_min=target_alt)
+
+        # switch into AUTO mode and raise throttle
+        self.change_mode("AUTO")
+        self.set_rc(3, 1500)
+
+        # fly the mission
+        self.wait_waypoint(0, num_wp-1, timeout=500)
+
+        # altitude check
+        self.wait_altitude(target_alt - 1 , target_alt + 1, relative=True)
+
+        self.change_mode('LAND')
+
+        # set throttle to minimum
+        self.zero_throttle()
+
+        # wait for disarm
+        self.wait_disarmed()
+        self.progress("MOTORS DISARMED OK")
+
     def fly_motor_fail(self, fail_servo=0, fail_mul=0.0, holdtime=30):
         """Test flight with reduced motor efficiency"""
 
@@ -2473,10 +2679,11 @@ class AutoTestCopter(AutoTest):
             # now add a notch and check that post-filter the peak is squashed below 40dB
             self.set_parameters({
                 "INS_LOG_BAT_OPT": 2,
-                "INS_NOTCH_ENABLE": 1,
-                "INS_NOTCH_FREQ": freq,
-                "INS_NOTCH_ATT": 50,
-                "INS_NOTCH_BW": freq/2,
+                "INS_HNTC2_ENABLE": 1,
+                "INS_HNTC2_FREQ": freq,
+                "INS_HNTC2_ATT": 50,
+                "INS_HNTC2_BW": freq/2,
+                "INS_HNTC2_MODE": 0,
                 "SIM_VIB_MOT_MAX": 350,
             })
             self.reboot_sitl()
@@ -2848,11 +3055,7 @@ class AutoTestCopter(AutoTest):
             self.reboot_sitl()
 
             self.progress("Making sure we now get RANGEFINDER messages")
-            m = self.mav.recv_match(type='RANGEFINDER',
-                                    blocking=True,
-                                    timeout=10)
-            if m is None:
-                raise NotAchievedException("Did not get expected RANGEFINDER msg")
+            m = self.assert_receive_message('RANGEFINDER', timeout=10)
 
             self.progress("Checking RangeFinder is marked as enabled in mavlink")
             m = self.mav.recv_match(type='SYS_STATUS',
@@ -3160,6 +3363,87 @@ class AutoTestCopter(AutoTest):
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
 
+        self.progress("Test mavlink triggering")
+        self.takeoff(20)
+        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
+                     mavutil.mavlink.PARACHUTE_DISABLE, # param1
+                     0, # param2
+                     0, # param3
+                     0, # param4
+                     0, # param5
+                     0, # param6
+                     0 # param7
+                     )
+        ok = False
+        try:
+            self.wait_statustext('BANG', timeout=2)
+        except AutoTestTimeoutException:
+            ok = True
+        if not ok:
+            raise NotAchievedException("Disabled parachute fired")
+        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
+                     mavutil.mavlink.PARACHUTE_ENABLE, # param1
+                     0, # param2
+                     0, # param3
+                     0, # param4
+                     0, # param5
+                     0, # param6
+                     0 # param7
+                     )
+        ok = False
+        try:
+            self.wait_statustext('BANG', timeout=2)
+        except AutoTestTimeoutException:
+            ok = True
+        if not ok:
+            raise NotAchievedException("Enabled parachute fired")
+
+        self.set_rc(9, 1000)
+        self.disarm_vehicle(force=True)
+        self.reboot_sitl()
+
+        # parachute should not fire if you go from disabled to release:
+        self.takeoff(20)
+        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
+                     mavutil.mavlink.PARACHUTE_RELEASE,
+                     0, # param2
+                     0, # param3
+                     0, # param4
+                     0, # param5
+                     0, # param6
+                     0 # param7
+                     )
+        ok = False
+        try:
+            self.wait_statustext('BANG', timeout=2)
+        except AutoTestTimeoutException:
+            ok = True
+        if not ok:
+            raise NotAchievedException("Parachute fired when going straight from disabled to release")
+
+        # now enable then release parachute:
+        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
+                     mavutil.mavlink.PARACHUTE_ENABLE, # param1
+                     0, # param2
+                     0, # param3
+                     0, # param4
+                     0, # param5
+                     0, # param6
+                     0 # param7
+                     )
+        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
+                     mavutil.mavlink.PARACHUTE_RELEASE,
+                     0, # param2
+                     0, # param3
+                     0, # param4
+                     0, # param5
+                     0, # param6
+                     0 # param7
+                     )
+        self.wait_statustext('BANG! Parachute deployed', timeout=2)
+        self.disarm_vehicle(force=True)
+        self.reboot_sitl()
+
         self.context_push()
         self.progress("Crashing with 3pos switch in enable position")
         self.takeoff(40)
@@ -3168,7 +3452,7 @@ class AutoTestCopter(AutoTest):
             "SIM_ENGINE_MUL": 0,
             "SIM_ENGINE_FAIL": 1,
         })
-        self.wait_statustext('BANG', timeout=60)
+        self.wait_statustext('BANG! Parachute deployed', timeout=60)
         self.set_rc(9, 1000)
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
@@ -3296,6 +3580,54 @@ class AutoTestCopter(AutoTest):
 
         if ex is not None:
             raise ex
+
+    def Landing(self):
+        """Test landing the aircraft."""
+
+        def check_landing_speeds(land_speed_high, land_speed_low, land_alt_low, land_speed_high_accuracy=0.1):
+            self.progress("Checking landing speeds (speed_high=%f speed_low=%f alt_low=%f" %
+                          (land_speed_high, land_speed_low, land_alt_low))
+            land_high_maintain = 5
+            land_low_maintain = land_alt_low / land_speed_low / 2
+
+            takeoff_alt = (land_high_maintain * land_speed_high + land_alt_low) + 20
+            # this is pretty rough, but takes *so much longer* in LOITER
+            self.takeoff(takeoff_alt, mode='STABILIZE', timeout=200, takeoff_throttle=2000)
+            # check default landing speeds:
+            self.change_mode('LAND')
+            # ensure higher-alt descent rate:
+            self.wait_descent_rate(land_speed_high,
+                                   minimum_duration=land_high_maintain,
+                                   accuracy=land_speed_high_accuracy)
+            self.wait_descent_rate(land_speed_low)
+            # ensure we transition to low descent rate at correct height:
+            self.assert_altitude(land_alt_low, relative=True)
+            # now make sure we maintain that descent rate:
+            self.wait_descent_rate(land_speed_low, minimum_duration=land_low_maintain)
+            self.wait_disarmed()
+
+        # test the defaults.  By default LAND_SPEED_HIGH is 0 so
+        # WPNAV_SPEED_DN is used
+        check_landing_speeds(
+            self.get_parameter("WPNAV_SPEED_DN") / 100,  # cm/s -> m/s
+            self.get_parameter("LAND_SPEED") / 100,  # cm/s -> m/s
+            self.get_parameter("LAND_ALT_LOW") / 100 # cm -> m
+        )
+
+        def test_landing_speeds(land_speed_high, land_speed_low, land_alt_low, **kwargs):
+            self.set_parameters({
+                "LAND_SPEED_HIGH": land_speed_high * 100,  # m/s -> cm/s
+                "LAND_SPEED": land_speed_low * 100,  # m/s -> cm/s
+                "LAND_ALT_LOW": land_alt_low * 100,  # m -> cm
+            })
+            check_landing_speeds(land_speed_high, land_speed_low, land_alt_low, **kwargs)
+
+        test_landing_speeds(
+            5,  # descent speed high
+            1,  # descent speed low
+            30,  # transition altitude
+            land_speed_high_accuracy=0.5
+        )
 
     def get_system_clock_utc(self, time_seconds):
         # this is a copy of ArduPilot's AP_RTC function!
@@ -3601,7 +3933,7 @@ class AutoTestCopter(AutoTest):
             self.set_parameter("FLTMODE_CH", fltmode_ch)
             self.set_rc(fltmode_ch, 1000) # PWM for mode1
             testmodes = [("FLTMODE1", 4, "GUIDED", 1165),
-                         ("FLTMODE2", 13, "SPORT", 1295),
+                         ("FLTMODE2", 2, "ALT_HOLD", 1295),
                          ("FLTMODE3", 6, "RTL", 1425),
                          ("FLTMODE4", 7, "CIRCLE", 1555),
                          ("FLTMODE5", 1, "ACRO", 1685),
@@ -3798,7 +4130,7 @@ class AutoTestCopter(AutoTest):
 
         if not (m.type_mask == (target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE) or m.type_mask == target_typemask):
             raise NotAchievedException("Did not receive proper mask: expected=%u or %u, got=%u" %
-                  ((target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE), target_typemask, m.type_mask))
+                                       ((target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE), target_typemask, m.type_mask))
 
         if x - m.x > 0.1:
             raise NotAchievedException("Did not receive proper target position x: wanted=%f got=%f" % (x, m.x))
@@ -3810,7 +4142,7 @@ class AutoTestCopter(AutoTest):
             raise NotAchievedException("Did not receive proper target position z: wanted=%f got=%f" % (z_up, -m.z))
 
     def test_guided_local_velocity_target(self, vx, vy, vz_up, timeout=3):
-        " Check local target velocity being recieved by vehicle "
+        " Check local target velocity being received by vehicle "
         self.progress("Setting local NED velocity target: (%f, %f, %f)" % (vx, vy, -vz_up))
         self.progress("Setting POSITION_TARGET_LOCAL_NED message rate to 10Hz")
         self.set_message_rate_hz(mavutil.mavlink.MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, 10)
@@ -3842,17 +4174,14 @@ class AutoTestCopter(AutoTest):
                 0, # yaw
                 0, # yawrate
             )
-            m = self.mav.recv_match(type='POSITION_TARGET_LOCAL_NED', blocking=True, timeout=1)
-
-            if m is None:
-                raise NotAchievedException("Did not receive any message for 1 sec")
+            m = self.assert_receive_message('POSITION_TARGET_LOCAL_NED')
 
             self.progress("Received local target: %s" % str(m))
 
         # Check the last received message
         if not (m.type_mask == (target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE) or m.type_mask == target_typemask):
             raise NotAchievedException("Did not receive proper mask: expected=%u or %u, got=%u" %
-                  ((target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE), target_typemask, m.type_mask))
+                                       ((target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE), target_typemask, m.type_mask))
 
         if vx - m.vx > 0.1:
             raise NotAchievedException("Did not receive proper target velocity vx: wanted=%f got=%f" % (vx, m.vx))
@@ -3864,6 +4193,47 @@ class AutoTestCopter(AutoTest):
             raise NotAchievedException("Did not receive proper target velocity vz: wanted=%f got=%f" % (vz_up, -m.vz))
 
         self.progress("Received proper target velocity commands")
+
+    def wait_for_local_velocity(self, vx, vy, vz_up, timeout=10):
+        """ Wait for local target velocity"""
+
+        # debug messages
+        self.progress("Waiting for local NED velocity target: (%f, %f, %f)" % (vx, vy, -vz_up))
+        self.progress("Setting LOCAL_POSITION_NED message rate to 10Hz")
+
+        # set position local ned message stream rate
+        self.set_message_rate_hz(mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 10)
+
+        # wait for position local ned message
+        tstart = self.get_sim_time()
+        while self.get_sim_time_cached() - tstart < timeout:
+
+            # get position target local ned message
+            m = self.mav.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=1)
+
+            # could not be able to get a valid target local ned message within given time
+            if m is None:
+
+                # raise an error that did not receive a valid target local ned message within given time
+                raise NotAchievedException("Did not receive any position local ned message for 1 second!")
+
+            # got a valid target local ned message within given time
+            else:
+
+                # debug message
+                self.progress("Received local position ned message: %s" % str(m))
+
+                # check if velocity values are in range
+                if vx - m.vx <= 0.1 and vy - m.vy <= 0.1 and vz_up - (-m.vz) <= 0.1:
+
+                    # get out of function
+                    self.progress("Vehicle successfully reached to target velocity!")
+                    return
+
+        # raise an exception
+        error_message = "Did not receive target velocities vx, vy, vz_up, wanted=(%f, %f, %f) got=(%f, %f, %f)"
+        error_message = error_message % (vx, vy, vz_up, m.vx, m.vy, -m.vz)
+        raise NotAchievedException(error_message)
 
     def test_position_target_message_mode(self):
         " Ensure that POSITION_TARGET_LOCAL_NED messages are sent in Guided Mode only "
@@ -4102,7 +4472,7 @@ class AutoTestCopter(AutoTest):
         self.run_cmd_do_set_mode("ACRO")
         self.wait_disarmed()
 
-    def test_mount_pitch(self, despitch, despitch_tolerance, timeout=10, hold=0):
+    def test_mount_pitch(self, despitch, despitch_tolerance, mount_mode, timeout=10, hold=0):
         tstart = self.get_sim_time()
         success_start = 0
         while True:
@@ -4113,6 +4483,10 @@ class AutoTestCopter(AutoTest):
             m = self.mav.recv_match(type='MOUNT_STATUS',
                                     blocking=True,
                                     timeout=5)
+
+            if m.mount_mode != mount_mode:
+                raise NotAchievedException("MAV_MOUNT_MODE Not: %s" % (mount_mode))
+
 #            self.progress("pitch=%f roll=%f yaw=%f" %
 #                          (m.pointing_a, m.pointing_b, m.pointing_c))
             mount_pitch = m.pointing_a/100.0 # centidegrees to degrees
@@ -4138,9 +4512,9 @@ class AutoTestCopter(AutoTest):
             1, # target compid
             0, # bitmask of things to ignore
             mavextra.euler_to_quat([0, math.radians(pitch), 0]), # att
-            0, # roll rate (rad/s)
-            1, # pitch rate
-            0, # yaw rate
+            0, # roll rate  (rad/s)
+            0, # pitch rate (rad/s)
+            0, # yaw rate   (rad/s)
             0.5) # thrust, 0 to 1, translated to a climb/descent rate
 
     def setup_servo_mount(self, roll_servo=5, pitch_servo=6, yaw_servo=7):
@@ -4180,6 +4554,10 @@ class AutoTestCopter(AutoTest):
             m = self.mav.recv_match(type='MOUNT_STATUS',
                                     blocking=True,
                                     timeout=5)
+
+            if m.mount_mode != mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING:
+                raise NotAchievedException("Mount_Mode: Default Not MAV_MOUNT_MODE_RC_TARGETING")
+
             if m.pointing_a != 0 or m.pointing_b != 0 or m.pointing_c != 0:
                 raise NotAchievedException("Mount stabilising when not requested")
 
@@ -4201,6 +4579,10 @@ class AutoTestCopter(AutoTest):
             m = self.mav.recv_match(type='MOUNT_STATUS',
                                     blocking=True,
                                     timeout=5)
+
+            if m.mount_mode != mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING:
+                raise NotAchievedException("Mount_Mode: changed when not requested")
+
             if m.pointing_a != 0 or m.pointing_b != 0 or m.pointing_c != 0:
                 raise NotAchievedException("Mount stabilising when not requested")
 
@@ -4214,7 +4596,7 @@ class AutoTestCopter(AutoTest):
                 0)
 
             self.do_pitch(despitch)
-            self.test_mount_pitch(-despitch, 1)
+            self.test_mount_pitch(-despitch, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
 
             self.progress("Disable pitch using MAV_CMD_DO_MOUNT_CONFIGURE")
             self.do_pitch(despitch)
@@ -4227,7 +4609,7 @@ class AutoTestCopter(AutoTest):
                          0,
                          0,
                          )
-            self.test_mount_pitch(0, 0)
+            self.test_mount_pitch(0, 0, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
 
             self.progress("Point somewhere using MOUNT_CONTROL (ANGLE)")
             self.do_pitch(despitch)
@@ -4248,7 +4630,7 @@ class AutoTestCopter(AutoTest):
                 0,  # yaw
                 0   # save position
             )
-            self.test_mount_pitch(20, 1)
+            self.test_mount_pitch(20, 1, mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING)
 
             self.progress("Point somewhere using MOUNT_CONTROL (GPS)")
             self.do_pitch(despitch)
@@ -4261,6 +4643,10 @@ class AutoTestCopter(AutoTest):
                          0,
                          0,
                          )
+
+            # Delay here to allow the attitude to command to timeout and level out the copter a bit
+            self.delay_sim_time(3)
+
             start = self.mav.location()
             self.progress("start=%s" % str(start))
             (t_lat, t_lon) = mavextra.gps_offset(start.lat, start.lng, 10, 20)
@@ -4277,7 +4663,7 @@ class AutoTestCopter(AutoTest):
                 t_alt * 100, # alt
                 0  # save position
             )
-            self.test_mount_pitch(-52, 5)
+            self.test_mount_pitch(-52, 5, mavutil.mavlink.MAV_MOUNT_MODE_GPS_POINT)
 
             # now test RC targetting
             self.progress("Testing mount RC targetting")
@@ -4290,9 +4676,9 @@ class AutoTestCopter(AutoTest):
                 1, # target compid
                 0, # bitmask of things to ignore
                 mavextra.euler_to_quat([0, 0, 0]), # att
-                1, # roll rate (rad/s)
-                1, # pitch rate
-                1, # yaw rate
+                0, # roll rate  (rad/s)
+                0, # pitch rate (rad/s)
+                0, # yaw rate   (rad/s)
                 0.5) # thrust, 0 to 1, translated to a climb/descent rate
 
             self.run_cmd(mavutil.mavlink.MAV_CMD_DO_MOUNT_CONFIGURE,
@@ -4318,7 +4704,7 @@ class AutoTestCopter(AutoTest):
                     12: 1500,
                     13: 1500,
                 })
-                self.test_mount_pitch(0, 1)
+                self.test_mount_pitch(0, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                 self.progress("Testing RC input down 1/4 of its range in the output, should be down 1/4 range in output")
                 rc12_in = 1400
                 rc12_min = 1100 # default
@@ -4330,9 +4716,9 @@ class AutoTestCopter(AutoTest):
                 if expected_pitch != -11.25:
                     raise NotAchievedException("Calculation wrong - defaults changed?!")
                 self.set_rc(12, rc12_in)
-                self.test_mount_pitch(-11.25, 0.01)
+                self.test_mount_pitch(-11.25, 0.01, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                 self.set_rc(12, 1800)
-                self.test_mount_pitch(33.75, 0.01)
+                self.test_mount_pitch(33.75, 0.01, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                 self.set_rc_from_map({
                     11: 1500,
                     12: 1500,
@@ -4352,11 +4738,11 @@ class AutoTestCopter(AutoTest):
                         "MNT_ANGMAX_TIL": 1000,
                     })
                     self.set_rc(12, 1000)
-                    self.test_mount_pitch(-90.00, 0.01)
+                    self.test_mount_pitch(-90.00, 0.01, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                     self.set_rc(12, 2000)
-                    self.test_mount_pitch(10.00, 0.01)
+                    self.test_mount_pitch(10.00, 0.01, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                     self.set_rc(12, 1500)
-                    self.test_mount_pitch(-40.00, 0.01)
+                    self.test_mount_pitch(-40.00, 0.01, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                 finally:
                     self.context_pop()
 
@@ -4364,23 +4750,23 @@ class AutoTestCopter(AutoTest):
 
                 self.progress("Testing RC rate control")
                 self.set_parameter('MNT_JSTICK_SPD', 10)
-                self.test_mount_pitch(0, 1)
+                self.test_mount_pitch(0, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                 self.set_rc(12, 1300)
-                self.test_mount_pitch(-5, 1)
-                self.test_mount_pitch(-10, 1)
-                self.test_mount_pitch(-15, 1)
-                self.test_mount_pitch(-20, 1)
+                self.test_mount_pitch(-5, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(-10, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(-15, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(-20, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
                 self.set_rc(12, 1700)
-                self.test_mount_pitch(-15, 1)
-                self.test_mount_pitch(-10, 1)
-                self.test_mount_pitch(-5, 1)
-                self.test_mount_pitch(0, 1)
-                self.test_mount_pitch(5, 1)
+                self.test_mount_pitch(-15, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(-10, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(-5, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(0, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
+                self.test_mount_pitch(5, 1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
 
                 self.progress("Reverting to angle mode")
                 self.set_parameter('MNT_JSTICK_SPD', 0)
                 self.set_rc(12, 1500)
-                self.test_mount_pitch(0, 0.1)
+                self.test_mount_pitch(0, 0.1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
 
                 self.context_pop()
 
@@ -4391,7 +4777,7 @@ class AutoTestCopter(AutoTest):
 
             self.progress("Testing mount ROI behaviour")
             self.drain_mav_unparsed()
-            self.test_mount_pitch(0, 0.1)
+            self.test_mount_pitch(0, 0.1, mavutil.mavlink.MAV_MOUNT_MODE_RC_TARGETING)
             start = self.mav.location()
             self.progress("start=%s" % str(start))
             (roi_lat, roi_lon) = mavextra.gps_offset(start.lat,
@@ -4409,7 +4795,7 @@ class AutoTestCopter(AutoTest):
                          roi_lon,
                          roi_alt,
                          )
-            self.test_mount_pitch(-52, 5)
+            self.test_mount_pitch(-52, 5, mavutil.mavlink.MAV_MOUNT_MODE_GPS_POINT)
 
             start = self.mav.location()
             (roi_lat, roi_lon) = mavextra.gps_offset(start.lat,
@@ -4427,7 +4813,7 @@ class AutoTestCopter(AutoTest):
                          roi_lon,
                          roi_alt,
                          )
-            self.test_mount_pitch(-7.5, 1)
+            self.test_mount_pitch(-7.5, 1, mavutil.mavlink.MAV_MOUNT_MODE_GPS_POINT)
 
             start = self.mav.location()
             (roi_lat, roi_lon) = mavextra.gps_offset(start.lat,
@@ -4447,7 +4833,7 @@ class AutoTestCopter(AutoTest):
                 roi_alt,
                 frame=mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
             )
-            self.test_mount_pitch(-7.5, 1)
+            self.test_mount_pitch(-7.5, 1, mavutil.mavlink.MAV_MOUNT_MODE_GPS_POINT)
             self.progress("Using MAV_CMD_DO_SET_ROI (COMMAND_INT), absolute-alt-frame")
             # this is pointing essentially straight down
             self.run_cmd_int(
@@ -4461,7 +4847,7 @@ class AutoTestCopter(AutoTest):
                 roi_alt,
                 frame=mavutil.mavlink.MAV_FRAME_GLOBAL,
             )
-            self.test_mount_pitch(-70, 1, hold=2)
+            self.test_mount_pitch(-70, 1, mavutil.mavlink.MAV_MOUNT_MODE_GPS_POINT, hold=2)
 
             self.run_cmd(mavutil.mavlink.MAV_CMD_DO_MOUNT_CONFIGURE,
                          mavutil.mavlink.MAV_MOUNT_MODE_NEUTRAL,
@@ -4472,10 +4858,10 @@ class AutoTestCopter(AutoTest):
                          0,
                          0,
                          )
-            self.test_mount_pitch(0, 0.1)
+            self.test_mount_pitch(0, 0.1, mavutil.mavlink.MAV_MOUNT_MODE_NEUTRAL)
 
             self.progress("Testing mount roi-sysid behaviour")
-            self.test_mount_pitch(0, 0.1)
+            self.test_mount_pitch(0, 0.1, mavutil.mavlink.MAV_MOUNT_MODE_NEUTRAL)
             start = self.mav.location()
             self.progress("start=%s" % str(start))
             (roi_lat, roi_lon) = mavextra.gps_offset(start.lat,
@@ -4504,7 +4890,7 @@ class AutoTestCopter(AutoTest):
                 0, # vz
                 0 # heading
             )
-            self.test_mount_pitch(-89, 5, hold=2)
+            self.test_mount_pitch(-89, 5, mavutil.mavlink.MAV_MOUNT_MODE_SYSID_TARGET, hold=2)
 
             self.mav.mav.global_position_int_send(
                 0, # time boot ms
@@ -4517,7 +4903,7 @@ class AutoTestCopter(AutoTest):
                 0, # vz
                 0 # heading
             )
-            self.test_mount_pitch(68, 5, hold=2)
+            self.test_mount_pitch(68, 5, mavutil.mavlink.MAV_MOUNT_MODE_SYSID_TARGET, hold=2)
 
             self.run_cmd(mavutil.mavlink.MAV_CMD_DO_MOUNT_CONFIGURE,
                          mavutil.mavlink.MAV_MOUNT_MODE_NEUTRAL,
@@ -4528,7 +4914,7 @@ class AutoTestCopter(AutoTest):
                          0,
                          0,
                          )
-            self.test_mount_pitch(0, 0.1)
+            self.test_mount_pitch(0, 0.1, mavutil.mavlink.MAV_MOUNT_MODE_NEUTRAL)
 
         except Exception as e:
             self.print_exception_caught(e)
@@ -4666,9 +5052,11 @@ class AutoTestCopter(AutoTest):
                                        (tdelta, max_good_tdelta))
         self.progress("Vehicle returned")
 
-    def hover_and_check_matched_frequency_with_fft(self, dblevel=-15, minhz=200, maxhz=300, peakhz=None, reverse=None):
+    def hover_and_check_matched_frequency_with_fft(self, dblevel=-15, minhz=200, maxhz=300, peakhz=None,
+                                                   reverse=None, takeoff=True):
         # find a motor peak
-        self.takeoff(10, mode="ALT_HOLD")
+        if takeoff:
+            self.takeoff(10, mode="ALT_HOLD")
 
         hover_time = 15
         tstart = self.get_sim_time()
@@ -4807,6 +5195,39 @@ class AutoTestCopter(AutoTest):
             raise NotAchievedException(
                 "Notch-per-motor peak was higher than single-notch peak %fdB > %fdB" %
                 (peakdb2, peakdb1))
+
+        # Now do it again for an octacopter
+        self.context_push()
+        ex = None
+        try:
+            self.progress("Flying Octacopter with ESC telemetry driven dynamic notches")
+            self.set_parameter("INS_HNTCH_OPTS", 0)
+            self.customise_SITL_commandline(
+                [],
+                defaults_filepath=','.join(self.model_defaults_filepath("octa")),
+                model="octa"
+            )
+            freq, vfr_hud, peakdb1 = self.hover_and_check_matched_frequency_with_fft(-10, 20, 350, reverse=True)
+
+            # now add notch-per motor and check that the peak is squashed
+            self.set_parameter("INS_HNTCH_HMNCS", 1)
+            self.set_parameter("INS_HNTCH_OPTS", 2)
+            self.reboot_sitl()
+
+            freq, vfr_hud, peakdb2 = self.hover_and_check_matched_frequency_with_fft(-15, 20, 350, reverse=True)
+
+            # notch-per-motor should do better, but check for within 5%
+            if peakdb2 * 1.05 > peakdb1:
+                raise NotAchievedException(
+                    "Notch-per-motor peak was higher than single-notch peak %fdB > %fdB" %
+                    (peakdb2, peakdb1))
+        except Exception as e:
+            self.print_exception_caught(e)
+            ex = e
+        self.context_pop()
+        self.reboot_sitl()
+        if ex is not None:
+            raise ex
 
     def hover_and_check_matched_frequency(self, dblevel=-15, minhz=200, maxhz=300, fftLength=32, peakhz=None):
         # find a motor peak
@@ -4979,7 +5400,7 @@ class AutoTestCopter(AutoTest):
             self.set_parameters({
                 "INS_LOG_BAT_OPT": 2,
                 "INS_HNTCH_ENABLE": 1,
-                "INS_HNTCH_HMNCS": 3,
+                "INS_HNTCH_HMNCS": 1,
                 "INS_HNTCH_MODE": 4,
                 "INS_HNTCH_FREQ": freq,
                 "INS_HNTCH_REF": vfr_hud.throttle/100.0,
@@ -5168,6 +5589,158 @@ class AutoTestCopter(AutoTest):
         self.context_pop()
 
         # must reboot after we move away from EKF type 10 to EKF2 or EKF3
+        self.reboot_sitl()
+
+        if ex is not None:
+            raise ex
+
+    def fly_gyro_fft_average(self):
+        """Use dynamic harmonic notch to control motor noise setup via FFT averaging."""
+        # basic gyro sample rate test
+        self.progress("Flying with gyro FFT harmonic - Gyro sample rate")
+        self.context_push()
+        ex = None
+        try:
+            # Step 1
+            self.start_subtest("Hover to calculate approximate hover frequency and see that it is tracked")
+            # magic tridge EKF type that dramatically speeds up the test
+            self.set_parameters({
+                "AHRS_EKF_TYPE": 10,
+                "EK2_ENABLE": 0,
+                "EK3_ENABLE": 0,
+                "INS_LOG_BAT_MASK": 3,
+                "INS_LOG_BAT_OPT": 2,
+                "INS_GYRO_FILTER": 100,
+                "INS_FAST_SAMPLE": 0,
+                "INS_HNTCH_ATT": 100,
+                "LOG_BITMASK": 958,
+                "LOG_DISARMED": 0,
+                "SIM_DRIFT_SPEED": 0,
+                "SIM_DRIFT_TIME": 0,
+                "SIM_GYR1_RND": 20,  # enable a noisy gyro
+            })
+            # motor peak enabling FFT will also enable the arming
+            # check, self-testing the functionality
+            self.set_parameters({
+                "FFT_ENABLE": 1,
+                "FFT_WINDOW_SIZE": 64,  # not the default, but makes the test more reliable
+                "FFT_SNR_REF": 10,
+            })
+
+            # Step 1: inject actual motor noise and use the FFT to track it
+            self.set_parameters({
+                "SIM_VIB_MOT_MAX": 250, # gives a motor peak at about 175Hz
+                "RC7_OPTION" : 162,   # FFT tune
+            })
+
+            self.reboot_sitl()
+
+            # hover and engage FFT tracker
+            self.takeoff(10, mode="ALT_HOLD")
+
+            hover_time = 60
+            tstart = self.get_sim_time()
+            self.progress("Hovering for %u seconds" % hover_time)
+
+            # start the tune
+            self.set_rc(7, 2000)
+
+            while self.get_sim_time_cached() < tstart + hover_time:
+                self.mav.recv_match(type='ATTITUDE', blocking=True)
+            vfr_hud = self.mav.recv_match(type='VFR_HUD', blocking=True)
+            tend = self.get_sim_time()
+
+            # finish the tune
+            self.set_rc(7, 1000)
+
+            psd = self.mavfft_fttd(1, 0, tstart * 1.0e6, tend * 1.0e6)
+
+            # batch sampler defaults give 1024 fft and sample rate of 1kz so roughly 1hz/bin
+            freq = psd["F"][numpy.argmax(psd["X"][50:450]) + 50] * (1000. / 1024.)
+
+            detected_ref = self.get_parameter("INS_HNTCH_REF")
+            detected_freq = self.get_parameter("INS_HNTCH_FREQ")
+            self.progress("FFT detected parameters were %fHz, ref %f" % (detected_freq, detected_ref))
+
+            # approximate the scaled frequency
+            scaled_freq_at_hover = math.sqrt((vfr_hud.throttle / 100.) / detected_ref) * detected_freq
+
+            # Check we matched
+            if abs(scaled_freq_at_hover - freq) / scaled_freq_at_hover > 0.05:
+                raise NotAchievedException("Detected frequency %fHz did not match required %fHz" %
+                                           (scaled_freq_at_hover, freq))
+
+            if self.get_parameter("INS_HNTCH_ENABLE") != 1:
+                raise NotAchievedException("Harmonic notch was not enabled")
+
+            # Step 2: now rerun the test and check that the peak is squashed
+            self.start_subtest("Verify that noise is suppressed by the harmonic notch")
+            self.hover_and_check_matched_frequency_with_fft(0, 100, 350, reverse=True, takeoff=False)
+
+            # Step 3: add a second harmonic and check the first is still tracked
+            self.start_subtest("Add a fixed frequency harmonic at twice the hover frequency "
+                               "and check the right harmonic is found")
+            self.set_parameters({
+                "SIM_VIB_FREQ_X": freq * 2,
+                "SIM_VIB_FREQ_Y": freq * 2,
+                "SIM_VIB_FREQ_Z": freq * 2,
+                "SIM_VIB_MOT_MULT": 0.25,  # halve the motor noise so that the higher harmonic dominates
+            })
+            self.reboot_sitl()
+
+            # hover and engage FFT tracker
+            self.takeoff(10, mode="ALT_HOLD")
+
+            hover_time = 60
+            tstart = self.get_sim_time()
+            self.progress("Hovering for %u seconds" % hover_time)
+
+            # start the tune
+            self.set_rc(7, 2000)
+
+            while self.get_sim_time_cached() < tstart + hover_time:
+                self.mav.recv_match(type='ATTITUDE', blocking=True)
+            vfr_hud = self.mav.recv_match(type='VFR_HUD', blocking=True)
+            tend = self.get_sim_time()
+
+            # finish the tune
+            self.set_rc(7, 1000)
+
+            self.do_RTL()
+
+            detected_ref = self.get_parameter("INS_HNTCH_REF")
+            detected_freq = self.get_parameter("INS_HNTCH_FREQ")
+            self.progress("FFT detected parameters were %fHz, ref %f" % (detected_freq, detected_ref))
+
+            # approximate the scaled frequency
+            scaled_freq_at_hover = math.sqrt((vfr_hud.throttle / 100.) / detected_ref) * detected_freq
+
+            # Check we matched
+            if abs(scaled_freq_at_hover - freq) / scaled_freq_at_hover > 0.05:
+                raise NotAchievedException("Detected frequency %fHz did not match required %fHz" %
+                                           (scaled_freq_at_hover, freq))
+
+            if self.get_parameter("INS_HNTCH_ENABLE") != 1:
+                raise NotAchievedException("Harmonic notch was not enabled")
+
+            self.set_parameters({
+                "SIM_VIB_FREQ_X": 0,
+                "SIM_VIB_FREQ_Y": 0,
+                "SIM_VIB_FREQ_Z": 0,
+                "SIM_VIB_MOT_MULT": 1.0,
+            })
+            # prevent update parameters from messing with the settings when we pop the context
+            self.set_parameter("FFT_ENABLE", 0)
+            self.reboot_sitl()
+
+        except Exception as e:
+            self.print_exception_caught(e)
+            ex = e
+
+        self.context_pop()
+
+        # need a final reboot because weird things happen to your
+        # vehicle state when switching back from EKF type 10!
         self.reboot_sitl()
 
         if ex is not None:
@@ -5624,12 +6197,17 @@ class AutoTestCopter(AutoTest):
             self.set_parameters({
                 "FENCE_ENABLE": 1,
                 "PRX_TYPE": 10,
+                "PRX_LOG_RAW": 1,
                 "RC10_OPTION": 40, # proximity-enable
             })
             self.reboot_sitl()
             self.progress("Enabling proximity")
             self.set_rc(10, 2000)
             self.check_avoidance_corners()
+
+            self.assert_current_onboard_log_contains_message("PRX")
+            self.assert_current_onboard_log_contains_message("PRXR")
+
         except Exception as e:
             self.print_exception_caught(e)
             ex = e
@@ -5639,6 +6217,83 @@ class AutoTestCopter(AutoTest):
         self.reboot_sitl()
         if ex is not None:
             raise ex
+
+    def ProximitySensors(self):
+        '''ensure proximity sensors return appropriate data'''
+
+        self.set_parameters({
+            "SERIAL5_PROTOCOL": 11,
+            "OA_DB_OUTPUT": 3,
+            "OA_TYPE": 2,
+        })
+        sensors = [  # tuples of name, prx_type
+            ('sf45b', 8, {
+                mavutil.mavlink.MAV_SENSOR_ROTATION_NONE: 292,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_45: 257,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_90: 1130,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_135: 1283,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_180: 627,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_225: 967,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_270: 760,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_315: 762,
+            }),
+            ('rplidara2', 5, {
+                mavutil.mavlink.MAV_SENSOR_ROTATION_NONE: 277,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_45: 256,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_90: 1130,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_135: 1288,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_180: 626,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_225: 970,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_270: 762,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_315: 790,
+            }),
+            ('terarangertower', 3, {
+                mavutil.mavlink.MAV_SENSOR_ROTATION_NONE: 450,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_45: 282,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_90: 450,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_135: 450,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_180: 450,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_225: 450,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_270: 450,
+                mavutil.mavlink.MAV_SENSOR_ROTATION_YAW_315: 450,
+            }),
+        ]
+
+        # the following is a "magic" location SITL understands which
+        # has some posts near it:
+        home_string = "%s,%s,%s,%s" % (51.8752066, 14.6487840, 54.15, 0)
+        for (name, prx_type, expected_distances) in sensors:
+            self.start_subtest("Testing %s" % name)
+            self.set_parameter("PRX_TYPE", prx_type)
+            self.customise_SITL_commandline([
+                "--uartF=sim:%s:" % name,
+                "--home", home_string,
+            ])
+            self.wait_ready_to_arm()
+            expected_distances_copy = copy.copy(expected_distances)
+            tstart = self.get_sim_time()
+            failed = False
+            wants = []
+            gots = []
+            while True:
+                if self.get_sim_time_cached() - tstart > 30:
+                    raise AutoTestTimeoutException("Failed to get distances")
+                if len(expected_distances_copy.keys()) == 0:
+                    break
+                m = self.assert_receive_message("DISTANCE_SENSOR")
+                if m.orientation not in expected_distances_copy:
+                    continue
+                got = m.current_distance
+                want = expected_distances_copy[m.orientation]
+                wants.append(want)
+                gots.append(got)
+                if abs(want - got) > 5:
+                    failed = True
+                del expected_distances_copy[m.orientation]
+            if failed:
+                raise NotAchievedException(
+                    "Distance too great (%s) (want=%s != got=%s)" %
+                    (name, wants, gots))
 
     def fly_proximity_avoidance_test_alt_no_avoid(self):
         self.start_subtest("Alt-no-avoid")
@@ -5891,6 +6546,8 @@ class AutoTestCopter(AutoTest):
             self.wait_groundspeed(0, 0.3, timeout=120)
             self.land_and_disarm()
 
+            self.assert_current_onboard_log_contains_message("BCN")
+
         except Exception as e:
             self.print_exception_caught(e)
             ex = e
@@ -6032,9 +6689,7 @@ class AutoTestCopter(AutoTest):
             if self.get_sim_time_cached() - tstart > timeout:
                 raise NotAchievedException("Did not move to state/speed")
 
-            m = self.mav.recv_match(type="GENERATOR_STATUS", blocking=True, timeout=10)
-            if m is None:
-                raise NotAchievedException("Did not get GENERATOR_STATUS")
+            m = self.assert_receive_message("GENERATOR_STATUS", timeout=10)
 
             if m.generator_speed < rpm_min:
                 self.progress("Too slow (%u<%u)" % (m.generator_speed, rpm_min))
@@ -6068,19 +6723,9 @@ class AutoTestCopter(AutoTest):
 
         self.wait_generator_speed_and_state(0, 0, mavutil.mavlink.MAV_GENERATOR_STATUS_FLAG_OFF)
 
-        messages = []
-
-        def my_message_hook(mav, m):
-            if m.get_type() != 'STATUSTEXT':
-                return
-            messages.append(m)
-        self.install_message_hook(my_message_hook)
-        try:
-            self.set_rc(9, 2000) # remember this is a switch position - run
-        finally:
-            self.remove_message_hook(my_message_hook)
-        if "Generator HIGH" not in [x.text for x in messages]:
-            self.wait_statustext("Generator HIGH", timeout=60)
+        self.context_collect('STATUSTEXT')
+        self.set_rc(9, 2000) # remember this is a switch position - run
+        self.wait_statustext("Generator HIGH", check_context=True)
         self.set_rc(9, 1000) # remember this is a switch position - stop
         self.wait_statustext("requested state is not RUN", timeout=200)
 
@@ -6754,6 +7399,33 @@ class AutoTestCopter(AutoTest):
         self.drain_mav()
         self.assert_prearm_failure("Check MOT_PWM_MIN/MAX")
 
+    def SensorErrorFlags(self):
+        self.reboot_sitl()
+
+        for (param_names, param_value, expected_subsys, expected_ecode, desc) in [
+                (['SIM_BARO_DISABLE', 'SIM_BAR2_DISABLE'], 1, 18, 4, 'unhealthy'),
+                (['SIM_BARO_DISABLE', 'SIM_BAR2_DISABLE'], 0, 18, 0, 'healthy'),
+                (['SIM_MAG1_FAIL', 'SIM_MAG2_FAIL', 'SIM_MAG3_FAIL'], 1, 3, 4, 'unhealthy'),
+                (['SIM_MAG1_FAIL', 'SIM_MAG2_FAIL', 'SIM_MAG3_FAIL'], 0, 3, 0, 'healthy'),
+        ]:
+            sp = dict()
+            for name in param_names:
+                sp[name] = param_value
+            self.set_parameters(sp)
+            self.delay_sim_time(1)
+            mlog = self.dfreader_for_current_onboard_log()
+            success = False
+            while True:
+                m = mlog.recv_match(type='ERR')
+                print("Got (%s)" % str(m))
+                if m is None:
+                    break
+                if m.Subsys == expected_subsys and m.ECode == expected_ecode:  # baro / ecode
+                    success = True
+                    break
+            if not success:
+                raise NotAchievedException("Did not find %s log message" % desc)
+
     def test_alt_estimate_prearm(self):
         self.context_push()
         ex = None
@@ -6763,6 +7435,7 @@ class AutoTestCopter(AutoTest):
                 "SIM_BARO_DISABLE": 1,
                 "SIM_BARO2_DISABL": 1,
             })
+
             self.wait_gps_disable(position_vertical=True)
 
             # turn off arming checks (mandatory arming checks will still be run)
@@ -6991,7 +7664,6 @@ class AutoTestCopter(AutoTest):
             'heli-dual': "wrong binary, different takeoff regime",
             'heli': "wrong binary, different takeoff regime",
             'heli-blade360': "wrong binary, different takeoff regime",
-            'tri': "bad yaw rate",
         }
         for frame in sorted(copter_vinfo_options["frames"].keys()):
             self.start_subtest("Testing frame (%s)" % str(frame))
@@ -7199,10 +7871,7 @@ class AutoTestCopter(AutoTest):
             if self.get_sim_time_cached() - tstart > 30 and self.mode_is('LAND'):
                 self.progress("Bug not reproduced")
                 break
-            m = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
-            self.progress("Received (%s)" % str(m))
-            if m is None:
-                raise NotAchievedException("No GLOBAL_POSITION_INT?!")
+            m = self.assert_receive_message('GLOBAL_POSITION_INT', timeout=1, verbose=True)
             pos_delta = self.get_distance_int(old_pos, m)
             self.progress("Distance: %f" % pos_delta)
             if pos_delta < 5:
@@ -7497,10 +8166,7 @@ class AutoTestCopter(AutoTest):
             if self.get_sim_time_cached() - tstart > 30 and self.mode_is('LAND'):
                 self.progress("Bug not reproduced")
                 break
-            m = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
-            self.progress("Received (%s)" % str(m))
-            if m is None:
-                raise NotAchievedException("No GLOBAL_POSITION_INT?!")
+            m = self.assert_receive_message('GLOBAL_POSITION_INT', timeout=1, verbose=True)
             pos_delta = self.get_distance_int(old_pos, m)
             self.progress("Distance: %f" % pos_delta)
             if pos_delta < 5:
@@ -7573,37 +8239,207 @@ class AutoTestCopter(AutoTest):
         self.context_pop()
 
     def PAUSE_CONTINUE(self):
-        self.load_mission("copter_mission.txt", strict=False)
+        self.load_mission(filename="copter_mission.txt", strict=False)
+        self.set_parameter(name="AUTO_OPTIONS", value=3)
+        self.change_mode(mode="AUTO")
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
 
-        self.set_parameter("AUTO_OPTIONS", 3)
+        self.wait_current_waypoint(wpnum=3, timeout=500)
+        self.send_pause_command()
+        self.wait_groundspeed(speed_min=0, speed_max=1, minimum_duration=5)
+        self.send_resume_command()
+
+        self.wait_current_waypoint(wpnum=4, timeout=500)
+        self.send_pause_command()
+        self.wait_groundspeed(speed_min=0, speed_max=1, minimum_duration=5)
+        self.send_resume_command()
+
+        self.wait_disarmed(timeout=500)
+
+    def PAUSE_CONTINUE_GUIDED(self):
+        self.start_subtest("Started test for Pause/Continue in GUIDED mode with LOCATION!")
+        self.change_mode(mode="GUIDED")
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.set_parameter(name="GUID_TIMEOUT", value=120)
+        self.user_takeoff(alt_min=30)
+
+        # send vehicle to global position target
+        location = self.home_relative_loc_ne(n=300, e=0)
+        target_typemask = MAV_POS_TARGET_TYPE_MASK.POS_ONLY
+        self.mav.mav.set_position_target_global_int_send(
+            0, # timestamp
+            1, # target system_id
+            1, # target component id
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, # relative altitude frame
+            target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE, # target typemask as pos only
+            int(location.lat * 1e7), # lat
+            int(location.lng * 1e7), # lon
+            30, # alt
+            0, # vx
+            0, # vy
+            0, # vz
+            0, # afx
+            0, # afy
+            0, # afz
+            0, # yaw
+            0) # yawrate
+
+        self.wait_distance_to_home(distance_min=100, distance_max=150, timeout=120)
+        self.send_pause_command()
+        self.wait_groundspeed(speed_min=0, speed_max=1, minimum_duration=5)
+        self.send_resume_command()
+        self.wait_location(loc=location, timeout=120)
+
+        self.end_subtest("Ended test for Pause/Continue in GUIDED mode with LOCATION!")
+        self.start_subtest("Started test for Pause/Continue in GUIDED mode with DESTINATION!")
+        self.guided_achieve_heading(heading=270)
+
+        # move vehicle on x direction
+        location = self.offset_location_ne(location=self.mav.location(), metres_north=0, metres_east=-300)
+        self.mav.mav.set_position_target_local_ned_send(
+            0, # system time in milliseconds
+            1, # target system
+            1, # target component
+            mavutil.mavlink.MAV_FRAME_BODY_NED, # coordinate frame MAV_FRAME_BODY_NED
+            MAV_POS_TARGET_TYPE_MASK.POS_ONLY, # type mask (pos only)
+            300, # position x
+            0, # position y
+            0, # position z
+            0, # velocity x
+            0, # velocity y
+            0, # velocity z
+            0, # accel x
+            0, # accel y
+            0, # accel z
+            0, # yaw
+            0) # yaw rate
+
+        self.wait_location(loc=location, accuracy=200, timeout=120)
+        self.send_pause_command()
+        self.wait_groundspeed(speed_min=0, speed_max=1, minimum_duration=5)
+        self.send_resume_command()
+        self.wait_location(loc=location, timeout=120)
+
+        self.end_subtest("Ended test for Pause/Continue in GUIDED mode with DESTINATION!")
+        self.start_subtest("Started test for Pause/Continue in GUIDED mode with VELOCITY!")
+
+        # give velocity command
+        vx, vy, vz_up = (5, 5, 0)
+        self.test_guided_local_velocity_target(vx=vx, vy=vy, vz_up=vz_up, timeout=10)
+
+        self.wait_for_local_velocity(vx=vx, vy=vy, vz_up=vz_up, timeout=10)
+        self.send_pause_command()
+        self.wait_for_local_velocity(vx=0, vy=0, vz_up=0, timeout=10)
+        self.send_resume_command()
+        self.wait_for_local_velocity(vx=vx, vy=vy, vz_up=vz_up, timeout=10)
+        self.test_guided_local_velocity_target(vx=0, vy=0, vz_up=0, timeout=10)
+        self.wait_for_local_velocity(vx=0, vy=0, vz_up=0, timeout=10)
+
+        self.end_subtest("Ended test for Pause/Continue in GUIDED mode with VELOCITY!")
+        self.start_subtest("Started test for Pause/Continue in GUIDED mode with ACCELERATION!")
+
+        # give acceleration command
+        ax, ay, az_up = (1, 1, 0)
+        target_typemask = (MAV_POS_TARGET_TYPE_MASK.POS_IGNORE | MAV_POS_TARGET_TYPE_MASK.VEL_IGNORE |
+                           MAV_POS_TARGET_TYPE_MASK.YAW_IGNORE | MAV_POS_TARGET_TYPE_MASK.YAW_RATE_IGNORE)
+        self.mav.mav.set_position_target_local_ned_send(
+            0, # timestamp
+            1, # target system_id
+            1, # target component id
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE,
+            0, # x
+            0, # y
+            0, # z
+            0, # vx
+            0, # vy
+            0, # vz
+            ax, # afx
+            ay, # afy
+            -az_up, # afz
+            0, # yaw
+            0, # yawrate
+        )
+
+        self.wait_for_local_velocity(vx=5, vy=5, vz_up=0, timeout=10)
+        self.send_pause_command()
+        self.wait_for_local_velocity(vx=0, vy=0, vz_up=0, timeout=10)
+        self.send_resume_command()
+        self.wait_for_local_velocity(vx=5, vy=5, vz_up=0, timeout=10)
+        self.test_guided_local_velocity_target(vx=0, vy=0, vz_up=0, timeout=10)
+        self.wait_for_local_velocity(vx=0, vy=0, vz_up=0, timeout=10)
+        self.end_subtest("Ended test for Pause/Continue in GUIDED mode with ACCELERATION!")
+
+        # start pause/continue subtest with posvelaccel
+        self.start_subtest("Started test for Pause/Continue in GUIDED mode with POSITION and VELOCITY and ACCELERATION!")
+        self.guided_achieve_heading(heading=0)
+
+        # give posvelaccel command
+        x, y, z_up = (-300, 0, 30)
+        target_typemask = (MAV_POS_TARGET_TYPE_MASK.YAW_IGNORE | MAV_POS_TARGET_TYPE_MASK.YAW_RATE_IGNORE)
+        self.mav.mav.set_position_target_local_ned_send(
+            0, # timestamp
+            1, # target system_id
+            1, # target component id
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            target_typemask | MAV_POS_TARGET_TYPE_MASK.LAST_BYTE,
+            x, # x
+            y, # y
+            -z_up, # z
+            0, # vx
+            0, # vy
+            0, # vz
+            0, # afx
+            0, # afy
+            0, # afz
+            0, # yaw
+            0, # yawrate
+        )
+
+        self.wait_distance_to_local_position(local_position=(x, y, -z_up), distance_min=400, distance_max=450, timeout=120)
+        self.send_pause_command()
+        self.wait_for_local_velocity(0, 0, 0, timeout=10)
+        self.send_resume_command()
+        self.wait_distance_to_local_position(local_position=(x, y, -z_up), distance_min=0, distance_max=10, timeout=120)
+
+        self.end_subtest("Ended test for Pause/Continue in GUIDED mode with POSITION and VELOCITY and ACCELERATION!")
+        self.do_RTL(timeout=120)
+
+    def DO_CHANGE_SPEED(self):
+        self.load_mission("mission.txt", strict=False)
+
+        self.set_parameters({
+            "AUTO_OPTIONS": 3,
+            "ANGLE_MAX": 4500,
+        })
+
         self.change_mode('AUTO')
         self.wait_ready_to_arm()
         self.arm_vehicle()
 
-        self.wait_waypoint(4, 4)
-        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PAUSE_CONTINUE,
-                     0, # param1
-                     0, # param2
-                     0, # param3
-                     0, # param4
-                     0, # param5
-                     0, # param6
-                     0 # param7
-                     )
+        self.wait_current_waypoint(2)
+        self.wait_groundspeed(
+            14.5, 15.5,
+            minimum_duration=10,
+            timeout=60,
+        )
 
-        self.wait_groundspeed(0, 1, minimum_duration=5)
+        self.wait_current_waypoint(4)
+        self.wait_groundspeed(
+            9.5, 11.5,
+            minimum_duration=10,
+            timeout=60,
+        )
 
-        self.run_cmd(mavutil.mavlink.MAV_CMD_DO_PAUSE_CONTINUE,
-                     1, # param1
-                     0, # param2
-                     0, # param3
-                     0, # param4
-                     0, # param5
-                     0, # param6
-                     0 # param7
-                     )
-
-        self.wait_groundspeed(5, 100)
+        self.set_parameter("ANGLE_MAX", 6000)
+        self.wait_current_waypoint(6)
+        self.wait_groundspeed(
+            15.5, 16.5,
+            minimum_duration=10,
+            timeout=60,
+        )
 
         self.wait_disarmed()
 
@@ -7786,15 +8622,11 @@ class AutoTestCopter(AutoTest):
         self.delay_sim_time(5)
         content = self.fetch_file_via_ftp("@SYS/tasks.txt")
         self.progress("Got content (%s)" % str(content))
-        if "fast_loop" not in content:
-            raise NotAchievedException("Did not find fast_loop in content")
 
         lines = content.split("\n")
 
-        if not lines[0].startswith("TasksV1"):
-            raise NotAchievedException("Expected TasksV1 as first line first not (%s)" % lines[0])
-        if not lines[1].startswith("fast_loop"):
-            raise NotAchievedException("Expected fast_loop first, not (%s)" % lines[1])
+        if not lines[0].startswith("TasksV2"):
+            raise NotAchievedException("Expected TasksV2 as first line first not (%s)" % lines[0])
         # last line is empty, so -2 here
         if not lines[-2].startswith("AP_EFI::update"):
             raise NotAchievedException("Expected EFI last not (%s)" % lines[-2])
@@ -7834,6 +8666,10 @@ class AutoTestCopter(AutoTest):
             ("PrecisionLoiterCompanion",
              "Precision Loiter (Companion)",
              self.fly_precision_companion),  # 29s
+
+            ("Landing",
+             "Test landing",
+             self.Landing),
 
             ("PrecisionLandingSITL",
              "Precision Landing drivers (SITL)",
@@ -7896,6 +8732,10 @@ class AutoTestCopter(AutoTest):
             ("VibrationFailsafe",
              "Test Vibration Failsafe",
              self.test_vibration_failsafe),
+
+            ("EK3AccelBias",
+             "Test EK3 Accel Bias data",
+             self.EK3AccelBias),
 
             ("StabilityPatch",
              "Fly stability patch",
@@ -8011,6 +8851,10 @@ class AutoTestCopter(AutoTest):
              "Fly Optical Flow limits",
              self.fly_optical_flow_limits),  # 27s
 
+            ("OpticalFlowCalibration",
+             "Fly Optical Flow calibration",
+             self.fly_optical_flow_calibration),
+
             ("MotorFail",
              "Fly motor failure test",
              self.fly_motor_fail),
@@ -8022,6 +8866,10 @@ class AutoTestCopter(AutoTest):
             ("CopterMission",
              "Fly copter mission",
              self.fly_auto_test),  # 37s
+
+            ("TakeoffAlt",
+             "Test Takeoff command altitude",
+             self.test_takeoff_alt), # 12s
 
             ("SplineLastWaypoint",
              "Test Spline as last waypoint",
@@ -8150,8 +8998,12 @@ class AutoTestCopter(AutoTest):
              self.test_altitude_types),
 
             ("PAUSE_CONTINUE",
-             "Test MAV_CMD_PAUSE_CONTINUE",
+             "Test MAV_CMD_DO_PAUSE_CONTINUE in AUTO mode",
              self.PAUSE_CONTINUE),
+
+            ("PAUSE_CONTINUE_GUIDED",
+             "Test MAV_CMD_DO_PAUSE_CONTINUE in GUIDED mode",
+             self.PAUSE_CONTINUE_GUIDED),
 
             ("RichenPower",
              "Test RichenPower generator",
@@ -8226,6 +9078,11 @@ class AutoTestCopter(AutoTest):
                  self.fly_gyro_fft_harmonic,
                  attempts=8),
 
+            Test("GyroFFTAverage",
+                 "Fly Gyro FFT Averaging",
+                 self.fly_gyro_fft_average,
+                 attempts=1),
+
             Test("CompassReordering",
                  "Test Compass reordering when priorities are changed",
                  self.test_mag_reordering),  # 40sec?
@@ -8290,6 +9147,10 @@ class AutoTestCopter(AutoTest):
                  "Test FETtecESC",
                  self.FETtecESC),
 
+            Test("ProximitySensors",
+                 "Test Proximity Sensors",
+                 self.ProximitySensors),
+
             Test("GroundEffectCompensation_touchDownExpected",
                  "Test EKF's handling of touchdown-expected",
                  self.GroundEffectCompensation_touchDownExpected),
@@ -8297,6 +9158,10 @@ class AutoTestCopter(AutoTest):
             Test("GroundEffectCompensation_takeOffExpected",
                  "Test EKF's handling of takeoff-expected",
                  self.GroundEffectCompensation_takeOffExpected),
+
+            Test("DO_CHANGE_SPEED",
+                 "Change speed during misison using waypoint items",
+                 self.DO_CHANGE_SPEED),
 
             Test("WPNAV_SPEED",
                  "Change speed during misison",
@@ -8309,6 +9174,10 @@ class AutoTestCopter(AutoTest):
             Test("WPNAV_SPEED_DN",
                  "Change speed (down) during misison",
                  self.WPNAV_SPEED_DN),
+
+            Test("SensorErrorFlags",
+                 "Test we get ERR messages when sensors have issues",
+                 self.SensorErrorFlags),
 
             Test("GPSForYaw",
                  "Moving baseline GPS yaw",

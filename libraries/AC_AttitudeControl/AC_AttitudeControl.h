@@ -25,6 +25,7 @@
 #define AC_ATTITUDE_RATE_CONTROLLER_TIMEOUT             1.0f    // body-frame rate controller timeout in seconds
 #define AC_ATTITUDE_RATE_RP_CONTROLLER_OUT_MAX          1.0f    // body-frame rate controller maximum output (for roll-pitch axis)
 #define AC_ATTITUDE_RATE_YAW_CONTROLLER_OUT_MAX         1.0f    // body-frame rate controller maximum output (for yaw axis)
+#define AC_ATTITUDE_RATE_RELAX_TC                       0.16f   // This is used to decay the rate I term to 5% in half a second.
 
 #define AC_ATTITUDE_THRUST_ERROR_ANGLE                  radians(30.0f) // Thrust angle error above which yaw corrections are limited
 
@@ -63,8 +64,13 @@ public:
         _aparm(aparm),
         _motors(motors)
         {
+            _singleton = this;
             AP_Param::setup_object_defaults(this, var_info);
         }
+
+    static AC_AttitudeControl *get_singleton(void) {
+        return _singleton;
+    }
 
     // Empty destructor to suppress compiler warning
     virtual ~AC_AttitudeControl() {}
@@ -113,8 +119,11 @@ public:
     // get the pitch angular velocity limit in radians/s
     float get_ang_vel_pitch_max_rads() const { return radians(_ang_vel_pitch_max); }
 
-    // get the yaw slew limit
-    float get_slew_yaw_cds() const { return _slew_yaw; }
+    // get the yaw angular velocity limit in radians/s
+    float get_ang_vel_yaw_max_rads() const { return radians(_ang_vel_yaw_max); }
+
+    // get the slew yaw rate limit in deg/s
+    float get_slew_yaw_max_degs() const;
 
     // get the rate control input smoothing time constant
     float get_input_tc() const { return _input_tc; }
@@ -146,7 +155,8 @@ public:
     void inertial_frame_reset();
 
     // Command a Quaternion attitude with feedforward and smoothing
-    virtual void input_quaternion(Quaternion attitude_desired_quat);
+    // attitude_desired_quat: is updated on each time_step (_dt) by the integral of the angular velocity
+    virtual void input_quaternion(Quaternion& attitude_desired_quat, Vector3f ang_vel_target);
 
     // Command an euler roll and pitch angle and an euler yaw rate with angular velocity feedforward and smoothing
     virtual void input_euler_angle_roll_pitch_euler_rate_yaw(float euler_roll_angle_cd, float euler_pitch_angle_cd, float euler_yaw_rate_cds);
@@ -204,6 +214,9 @@ public:
 
     // Return the body-to-NED target attitude used by the quadplane-specific attitude control input methods
     Quaternion get_attitude_target_quat() const { return _attitude_target; }
+
+    // Return the angular velocity of the target (setpoint) [rad/s] in the target attitude frame
+    const Vector3f& get_attitude_target_ang_vel() const { return _ang_vel_target;}
 
     // Return the angle between the target thrust vector and the current thrust vector.
     float get_att_error_angle_deg() const { return degrees(_thrust_error_angle); }
@@ -292,7 +305,7 @@ public:
     // calculates the velocity correction from an angle error. The angular velocity has acceleration and
     // deceleration limits including basic jerk limiting using smoothing_gain
     static float input_shaping_angle(float error_angle, float input_tc, float accel_max, float target_ang_vel, float desired_ang_vel, float max_ang_vel, float dt);
-    static float input_shaping_angle(float error_angle, float smoothing_gain, float accel_max, float target_ang_vel, float dt){ return input_shaping_angle(error_angle,  smoothing_gain,  accel_max,  target_ang_vel,  0.0f,  0.0f,  dt); }
+    static float input_shaping_angle(float error_angle, float input_tc, float accel_max, float target_ang_vel, float dt){ return input_shaping_angle(error_angle,  input_tc,  accel_max,  target_ang_vel,  0.0f,  0.0f,  dt); }
 
     // limits the acceleration and deceleration of a velocity request
     static float input_shaping_ang_vel(float target_ang_vel, float desired_ang_vel, float accel_max, float dt);
@@ -354,6 +367,9 @@ public:
 
     // enable inverted flight on backends that support it
     virtual void set_inverted_flight(bool inverted) {}
+
+    // get the slew rate value for roll, pitch and yaw, for oscillation detection in lua scripts
+    void get_rpy_srate(float &roll_srate, float &pitch_srate, float &yaw_srate);
     
     // User settable parameters
     static const struct AP_Param::GroupInfo var_info[];
@@ -368,7 +384,7 @@ protected:
     virtual float get_roll_trim_rad() { return 0;}
 
     // Return the yaw slew rate limit in radians/s
-    float get_slew_yaw_rads() { return radians(_slew_yaw * 0.01f); }
+    float get_slew_yaw_max_rads() const { return radians(get_slew_yaw_max_degs()); }
 
     // Maximum rate the yaw target can be updated in Loiter, RTL, Auto flight modes
     AP_Float            _slew_yaw;
@@ -474,6 +490,8 @@ protected:
     const AP_AHRS_View&  _ahrs;
     const AP_Vehicle::MultiCopter &_aparm;
     AP_Motors&          _motors;
+
+    static AC_AttitudeControl *_singleton;
 
 protected:
     /*

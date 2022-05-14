@@ -21,6 +21,7 @@
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_Param/AP_Param.h>
 #include <AP_Vehicle/AP_Vehicle.h>
+#include <Filter/AverageFilter.h>
 
 class AP_Landing;
 class AP_TECS {
@@ -88,7 +89,12 @@ public:
     void reset_pitch_I(void) {
         _integSEB_state = 0.0f;
     }
-    
+
+    // reset throttle integrator
+    void reset_throttle_I(void) {
+        _integTHR_state = 0.0;
+    }
+
     // return landing sink rate
     float get_land_sinkrate(void) const {
         return _land_sink;

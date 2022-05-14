@@ -84,10 +84,6 @@
 #define HAL_BARO_20789_I2C_SPI  15
 #define HAL_BARO_LPS25H_IMU_I2C 17
 
-/* Compass driver types */
-#define HAL_COMPASS_NONE                0
-#define HAL_COMPASS_HIL_UNUSED          3  // unused
-
 /* Heat Types */
 #define HAL_LINUX_HEAT_PWM 1
 
@@ -200,10 +196,6 @@
 #define HAL_OS_FATFS_IO 0
 #endif
 
-#ifndef HAL_COMPASS_DEFAULT
-#define HAL_COMPASS_DEFAULT HAL_COMPASS_NONE
-#endif
-
 #ifndef HAL_BARO_DEFAULT
 #define HAL_BARO_DEFAULT HAL_BARO_NONE
 #endif
@@ -234,6 +226,10 @@
 
 #ifndef HAL_ENABLE_LIBUAVCAN_DRIVERS
 #define HAL_ENABLE_LIBUAVCAN_DRIVERS HAL_CANMANAGER_ENABLED
+#endif
+
+#ifndef AP_AIRSPEED_BACKEND_DEFAULT_ENABLED
+#define AP_AIRSPEED_BACKEND_DEFAULT_ENABLED 1
 #endif
 
 #ifdef HAVE_LIBDL
@@ -270,5 +266,38 @@
 #endif
 
 #ifndef HAL_WITH_MCU_MONITORING
-#define HAL_WITH_MCU_MONITORING defined(STM32H7)
+#define HAL_WITH_MCU_MONITORING 0
+#endif
+
+#ifndef HAL_HNF_MAX_FILTERS
+// On an F7 The difference in CPU load between 1 notch and 24 notches is about 2%
+// The difference in CPU load between 1Khz backend and 2Khz backend is about 10%
+// So at 1Khz almost all notch combinations can be supported on F7 and certainly H7
+#if defined(STM32H7) || CONFIG_HAL_BOARD == HAL_BOARD_SITL
+// Enough for a double-notch per motor on an octa using three IMUs and one harmonics
+// plus one static notch with one double-notch harmonics
+#define HAL_HNF_MAX_FILTERS 54
+#elif defined(STM32F7)
+// Enough for a notch per motor on an octa using three IMUs and one harmonics
+// plus one static notch with one harmonics
+#define HAL_HNF_MAX_FILTERS 27
+#else
+// Enough for a notch per motor on an octa quad using two IMUs and one harmonic
+// plus one static notch with one harmonic
+#define HAL_HNF_MAX_FILTERS 18
+#endif
+#endif // HAL_HNF_MAX_FILTERS
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL // allow SITL to have all the CANFD options
+#define HAL_CANFD_SUPPORTED 8
+#elif !defined(HAL_CANFD_SUPPORTED)
+#define HAL_CANFD_SUPPORTED 0
+#endif
+
+#ifndef __RAMFUNC__
+#define __RAMFUNC__
+#endif
+
+#ifndef __FASTRAMFUNC__
+#define __FASTRAMFUNC__
 #endif

@@ -19,7 +19,10 @@
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_Scheduler/AP_Scheduler.h>
 #include <AP_Notify/AP_Notify.h>
+#include <RC_Channel/RC_Channel.h>
+
 #include "AP_ICEngine.h"
+#include <AP_RPM/AP_RPM.h>
 
 extern const AP_HAL::HAL& hal;
 

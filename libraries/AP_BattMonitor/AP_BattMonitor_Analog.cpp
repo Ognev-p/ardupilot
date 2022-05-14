@@ -82,8 +82,8 @@ AP_BattMonitor_Analog::read()
     // read current
     if (has_current()) {
         // calculate time since last current read
-        uint32_t tnow = AP_HAL::micros();
-        float dt = tnow - _state.last_time_micros;
+        const uint32_t tnow = AP_HAL::micros();
+        const uint32_t dt_us = tnow - _state.last_time_micros;
 
         // this copes with changing the pin at runtime
         _state.healthy &= _curr_pin_analog_source->set_pin(_curr_pin);
@@ -91,13 +91,7 @@ AP_BattMonitor_Analog::read()
         // read current
         _state.current_amps = (_curr_pin_analog_source->voltage_average() - _curr_amp_offset) * _curr_amp_per_volt;
 
-        // update total current drawn since startup
-        if (_state.last_time_micros != 0 && dt < 2000000.0f) {
-            // .0002778 is 1/3600 (conversion to hours)
-            float mah = _state.current_amps * dt * 0.0000002778f;
-            _state.consumed_mah += mah;
-            _state.consumed_wh  += 0.001f * mah * _state.voltage;
-        }
+        update_consumed(_state, dt_us);
 
         // record time
         _state.last_time_micros = tnow;

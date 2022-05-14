@@ -4,8 +4,11 @@
 #include <AP_Common/AP_FWVersion.h>
 #include <AP_Arming/AP_Arming.h>
 #include <AP_Frsky_Telem/AP_Frsky_Parameters.h>
+#include <AP_Logger/AP_Logger.h>
 #include <AP_Mission/AP_Mission.h>
 #include <AP_OSD/AP_OSD.h>
+#include <AP_RPM/AP_RPM.h>
+#include <SRV_Channel/SRV_Channel.h>
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
 #include <AP_HAL_ChibiOS/sdcard.h>
 #endif
@@ -66,6 +69,16 @@ const AP_Param::GroupInfo AP_Vehicle::var_info[] = {
     // @Path: ../AP_EFI/AP_EFI.cpp
     AP_SUBGROUPINFO(efi, "EFI", 9, AP_Vehicle, AP_EFI),
 #endif
+
+#if AP_AIRSPEED_ENABLED
+    // @Group: ARSPD
+    // @Path: ../AP_Airspeed/AP_Airspeed.cpp
+    AP_SUBGROUPINFO(airspeed, "ARSPD", 10, AP_Vehicle, AP_Airspeed),
+#endif
+
+    // @Group: CUST_ROT
+    // @Path: ../AP_CustomRotations/AP_CustomRotations.cpp
+    AP_SUBGROUPINFO(custom_rotations, "CUST_ROT", 11, AP_Vehicle, AP_CustomRotations),
 
     AP_GROUPEND
 };
@@ -146,13 +159,25 @@ void AP_Vehicle::setup()
     // init_ardupilot is where the vehicle does most of its initialisation.
     init_ardupilot();
 
+#if AP_AIRSPEED_ENABLED
+    airspeed.init();
+    if (airspeed.enabled()) {
+        airspeed.calibrate(true);
+    } 
+#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)
+    else {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,"No airspeed sensor present or enabled");
+    }
+#endif
+#endif  // AP_AIRSPEED_ENABLED
+
 #if !APM_BUILD_TYPE(APM_BUILD_Replay)
     SRV_Channels::init();
 #endif
 
     // gyro FFT needs to be initialized really late
 #if HAL_GYROFFT_ENABLED
-    gyro_fft.init(AP::scheduler().get_loop_period_us());
+    gyro_fft.init(AP::scheduler().get_loop_rate_hz());
 #endif
 #if HAL_RUNCAM_ENABLED
     runcam.init();
@@ -185,6 +210,8 @@ void AP_Vehicle::setup()
 #if HAL_EFI_ENABLED
     efi.init();
 #endif
+
+    custom_rotations.init();
 
     gcs().send_text(MAV_SEVERITY_INFO, "ArduPilot Ready");
 }
@@ -220,16 +247,6 @@ void AP_Vehicle::loop()
 }
 
 /*
- fast loop callback for all vehicles. This will get called at the end of any vehicle-specific fast loop.
- */
-void AP_Vehicle::fast_loop()
-{
-#if HAL_GYROFFT_ENABLED
-    gyro_fft.sample_gyros();
-#endif
-}
-
-/*
   scheduler table - all regular tasks apart from the fast_loop()
   should be listed here.
 
@@ -256,6 +273,12 @@ SCHED_TASK_CLASS arguments:
 
  */
 const AP_Scheduler::Task AP_Vehicle::scheduler_tasks[] = {
+#if HAL_GYROFFT_ENABLED
+    FAST_TASK_CLASS(AP_GyroFFT,    &vehicle.gyro_fft,       sample_gyros),
+#endif
+#if AP_AIRSPEED_ENABLED
+    SCHED_TASK_CLASS(AP_Airspeed,  &vehicle.airspeed,       update,                   10, 100, 41),    // NOTE: the priority number here should be right before Plane's calc_airspeed_errors
+#endif
 #if HAL_RUNCAM_ENABLED
     SCHED_TASK_CLASS(AP_RunCam,    &vehicle.runcam,         update,                   50, 50, 200),
 #endif
@@ -267,7 +290,7 @@ const AP_Scheduler::Task AP_Vehicle::scheduler_tasks[] = {
     SCHED_TASK_CLASS(AP_VideoTX,   &vehicle.vtx,            update,                    2, 100, 220),
     SCHED_TASK(send_watchdog_reset_statustext,         0.1,     20, 225),
 #if HAL_WITH_ESC_TELEM
-    SCHED_TASK_CLASS(AP_ESC_Telem, &vehicle.esc_telem,      update,                   10,  50, 230),
+    SCHED_TASK_CLASS(AP_ESC_Telem, &vehicle.esc_telem,      update,                  100,  50, 230),
 #endif
 #if HAL_GENERATOR_ENABLED
     SCHED_TASK_CLASS(AP_Generator, &vehicle.generator,      update,                   10,  50, 235),
@@ -275,7 +298,9 @@ const AP_Scheduler::Task AP_Vehicle::scheduler_tasks[] = {
 #if OSD_ENABLED
     SCHED_TASK(publish_osd_info, 1, 10, 240),
 #endif
+#if HAL_INS_ACCELCAL_ENABLED
     SCHED_TASK(accel_cal_update,      10,    100, 245),
+#endif
 #if HAL_EFI_ENABLED
     SCHED_TASK_CLASS(AP_EFI,       &vehicle.efi,            update,                   10, 200, 250),
 #endif
@@ -364,36 +389,100 @@ bool AP_Vehicle::is_crashed() const
     return AP::arming().last_disarm_method() == AP_Arming::Method::CRASH;
 }
 
-// @LoggerMessage: FTN
-// @Description: Filter Tuning Messages
-// @Field: TimeUS: microseconds since system startup
-// @Field: NDn: number of active dynamic harmonic notches
-// @Field: DnF1: dynamic harmonic notch centre frequency for motor 1
-// @Field: DnF2: dynamic harmonic notch centre frequency for motor 2
-// @Field: DnF3: dynamic harmonic notch centre frequency for motor 3
-// @Field: DnF4: dynamic harmonic notch centre frequency for motor 4
-void AP_Vehicle::write_notch_log_messages() const
+// update the harmonic notch filter center frequency dynamically
+void AP_Vehicle::update_dynamic_notch(AP_InertialSensor::HarmonicNotch &notch)
 {
-    const float* notches = ins.get_gyro_dynamic_notch_center_frequencies_hz();
-    AP::logger().Write(
-        "FTN", "TimeUS,NDn,DnF1,DnF2,DnF3,DnF4", "s-zzzz", "F-----", "QBffff", AP_HAL::micros64(), ins.get_num_gyro_dynamic_notch_center_frequencies(),
-            notches[0], notches[1], notches[2], notches[3]);
+#if APM_BUILD_TYPE(APM_BUILD_ArduPlane)||APM_BUILD_COPTER_OR_HELI
+    if (!notch.params.enabled()) {
+        return;
+    }
+    const float ref_freq = notch.params.center_freq_hz();
+    const float ref = notch.params.reference();
+    if (is_zero(ref)) {
+        notch.update_freq_hz(ref_freq);
+        return;
+    }
+
+    const AP_Motors* motors = AP::motors();
+    const float motors_throttle = motors != nullptr ? MAX(0,motors->get_throttle_out()) : 0;
+    const float throttle_freq = ref_freq * MAX(1.0f, sqrtf(motors_throttle / ref));
+
+    switch (notch.params.tracking_mode()) {
+        case HarmonicNotchDynamicMode::UpdateThrottle: // throttle based tracking
+            // set the harmonic notch filter frequency approximately scaled on motor rpm implied by throttle
+            notch.update_freq_hz(throttle_freq);
+            break;
+
+        case HarmonicNotchDynamicMode::UpdateRPM: // rpm sensor based tracking
+        case HarmonicNotchDynamicMode::UpdateRPM2: {
+            const auto *rpm_sensor = AP::rpm();
+            uint8_t sensor = (notch.params.tracking_mode()==HarmonicNotchDynamicMode::UpdateRPM?0:1);
+            float rpm;
+            if (rpm_sensor != nullptr && rpm_sensor->get_rpm(sensor, rpm)) {
+                // set the harmonic notch filter frequency from the main rotor rpm
+                notch.update_freq_hz(MAX(ref_freq, rpm * ref * (1.0/60)));
+            } else {
+                notch.update_freq_hz(ref_freq);
+            }
+            break;
+        }
+#if HAL_WITH_ESC_TELEM
+        case HarmonicNotchDynamicMode::UpdateBLHeli: // BLHeli based tracking
+            // set the harmonic notch filter frequency scaled on measured frequency
+            if (notch.params.hasOption(HarmonicNotchFilterParams::Options::DynamicHarmonic)) {
+                float notches[INS_MAX_NOTCHES];
+                const uint8_t num_notches = AP::esc_telem().get_motor_frequencies_hz(notch.num_dynamic_notches, notches);
+
+                for (uint8_t i = 0; i < num_notches; i++) {
+                    notches[i] =  MAX(ref_freq, notches[i]);
+                }
+                if (num_notches > 0) {
+                    notch.update_frequencies_hz(num_notches, notches);
+                } else {    // throttle fallback
+                    notch.update_freq_hz(throttle_freq);
+                }
+            } else {
+                notch.update_freq_hz(MAX(ref_freq, AP::esc_telem().get_average_motor_frequency_hz() * ref));
+            }
+            break;
+#endif
+#if HAL_GYROFFT_ENABLED
+        case HarmonicNotchDynamicMode::UpdateGyroFFT: // FFT based tracking
+            // set the harmonic notch filter frequency scaled on measured frequency
+            if (notch.params.hasOption(HarmonicNotchFilterParams::Options::DynamicHarmonic)) {
+                float notches[INS_MAX_NOTCHES];
+                const uint8_t peaks = gyro_fft.get_weighted_noise_center_frequencies_hz(notch.num_dynamic_notches, notches);
+
+                notch.update_frequencies_hz(peaks, notches);
+            } else {
+                notch.update_freq_hz(gyro_fft.get_weighted_noise_center_freq_hz());
+            }
+            break;
+#endif
+        case HarmonicNotchDynamicMode::Fixed: // static
+        default:
+            notch.update_freq_hz(ref_freq);
+            break;
+    }
+#endif // APM_BUILD_TYPE(APM_BUILD_ArduPlane)||APM_BUILD_COPTER_OR_HELI
 }
+
 
 // run notch update at either loop rate or 200Hz
 void AP_Vehicle::update_dynamic_notch_at_specified_rate()
 {
-    if (ins.has_harmonic_option(HarmonicNotchFilterParams::Options::LoopRateUpdate)) {
-        update_dynamic_notch();
-        return;
-    }
-
-    // decimated update at 200Hz
-    const uint32_t now = AP_HAL::millis();
-
-    if (now - _last_notch_update_ms > 5) {
-        _last_notch_update_ms = now;
-        update_dynamic_notch();
+    for (auto &notch : ins.harmonic_notches) {
+        if (notch.params.hasOption(HarmonicNotchFilterParams::Options::LoopRateUpdate)) {
+            update_dynamic_notch(notch);
+        } else {
+            // decimated update at 200Hz
+            const uint32_t now = AP_HAL::millis();
+            const uint8_t i = &notch - &ins.harmonic_notches[0];
+            if (now - _last_notch_update_ms[i] > 5) {
+                _last_notch_update_ms[i] = now;
+                update_dynamic_notch(notch);
+            }
+        }
     }
 }
 
@@ -471,6 +560,8 @@ void AP_Vehicle::get_osd_roll_pitch_rad(float &roll, float &pitch) const
 
 #endif
 
+#if HAL_INS_ACCELCAL_ENABLED
+
 #ifndef HAL_CAL_ALWAYS_REBOOT
 // allow for forced reboot after accelcal
 #define HAL_CAL_ALWAYS_REBOOT 0
@@ -481,7 +572,6 @@ void AP_Vehicle::get_osd_roll_pitch_rad(float &roll, float &pitch) const
  */
 void AP_Vehicle::accel_cal_update()
 {
-#if HAL_INS_ENABLED
     if (hal.util->get_soft_armed()) {
         return;
     }
@@ -499,9 +589,8 @@ void AP_Vehicle::accel_cal_update()
         hal.scheduler->reboot(false);
     }
 #endif
-#endif // HAL_INS_ENABLED
 }
-
+#endif // HAL_INS_ACCELCAL_ENABLED
 
 AP_Vehicle *AP_Vehicle::_singleton = nullptr;
 
@@ -518,3 +607,4 @@ AP_Vehicle *vehicle()
 }
 
 };
+

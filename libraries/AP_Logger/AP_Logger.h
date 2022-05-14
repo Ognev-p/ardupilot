@@ -11,7 +11,7 @@
 
 // set default for HAL_LOGGING_DATAFLASH_ENABLED
 #ifndef HAL_LOGGING_DATAFLASH_ENABLED
-#define HAL_LOGGING_DATAFLASH_ENABLED 0
+#define HAL_LOGGING_DATAFLASH_ENABLED (CONFIG_HAL_BOARD == HAL_BOARD_SITL)
 #endif
 
 #ifndef HAL_LOGGING_MAVLINK_ENABLED
@@ -26,25 +26,10 @@
     #endif
 #endif
 
-#ifndef HAL_LOGGING_SITL_ENABLED
-    #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-        #define HAL_LOGGING_SITL_ENABLED HAL_LOGGING_ENABLED
-    #else
-        #define HAL_LOGGING_SITL_ENABLED 0
-    #endif
-#endif
-
-#if HAL_LOGGING_SITL_ENABLED || HAL_LOGGING_DATAFLASH_ENABLED
+#if HAL_LOGGING_DATAFLASH_ENABLED
     #define HAL_LOGGING_BLOCK_ENABLED 1
 #else
     #define HAL_LOGGING_BLOCK_ENABLED 0
-#endif
-
-// sanity checks:
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    #if HAL_LOGGING_DATAFLASH_ENABLED
-        #error DATAFLASH not supported on SITL; you probably mean SITL
-    #endif
 #endif
 
 #if HAL_LOGGING_FILESYSTEM_ENABLED
@@ -63,18 +48,16 @@
 #define HAL_LOGGER_FILE_CONTENTS_ENABLED HAL_LOGGING_FILESYSTEM_ENABLED
 #endif
 
+#include <AC_PID/AC_PID.h>
 #include <AP_HAL/AP_HAL.h>
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_AHRS/AP_AHRS_DCM.h>
 #include <AP_Common/AP_Common.h>
 #include <AP_Param/AP_Param.h>
 #include <AP_Mission/AP_Mission.h>
-#include <AP_RPM/AP_RPM.h>
 #include <AP_Logger/LogStructure.h>
 #include <AP_Motors/AP_Motors.h>
 #include <AP_Rally/AP_Rally.h>
-#include <AP_Beacon/AP_Beacon.h>
-#include <AP_Proximity/AP_Proximity.h>
 #include <AP_Vehicle/ModeReason.h>
 
 #include <stdint.h>
@@ -319,14 +302,9 @@ public:
                        bool was_command_long=false);
     void Write_Mission_Cmd(const AP_Mission &mission,
                                const AP_Mission::Mission_Command &cmd);
-    void Write_RPM(const AP_RPM &rpm_sensor);
     void Write_RallyPoint(uint8_t total,
                           uint8_t sequence,
                           const RallyLocation &rally_point);
-    void Write_Beacon(AP_Beacon &beacon);
-#if HAL_PROXIMITY_ENABLED
-    void Write_Proximity(AP_Proximity &proximity);
-#endif
     void Write_SRTL(bool active, uint16_t num_points, uint16_t max_points, uint8_t action, const Vector3f& point);
     void Write_Winch(bool healthy, bool thread_end, bool moving, bool clutch, uint8_t mode, float desired_length, float length, float desired_rate, uint16_t tension, float voltage, int8_t temp);
     void Write_PSCN(float pos_target, float pos, float vel_desired, float vel_target, float vel, float accel_desired, float accel_target, float accel);
@@ -341,21 +319,7 @@ public:
     void WriteCritical(const char *name, const char *labels, const char *units, const char *mults, const char *fmt, ...);
     void WriteV(const char *name, const char *labels, const char *units, const char *mults, const char *fmt, va_list arg_list, bool is_critical=false, bool is_streaming=false);
 
-    // This structure provides information on the internal member data of a PID for logging purposes
-    struct PID_Info {
-        float target;
-        float actual;
-        float error;
-        float P;
-        float I;
-        float D;
-        float FF;
-        float Dmod;
-        float slew_rate;
-        bool  limit;
-    };
-
-    void Write_PID(uint8_t msg_type, const PID_Info &info);
+    void Write_PID(uint8_t msg_type, const AP_PIDInfo &info);
 
     // returns true if logging of a message should be attempted
     bool should_log(uint32_t mask) const;
@@ -415,7 +379,12 @@ public:
 
     // notify logging subsystem of an arming failure. This triggers
     // logging for HAL_LOGGER_ARM_PERSIST seconds
-    void arming_failure() { _last_arming_failure_ms = AP_HAL::millis(); }
+    void arming_failure() {
+        _last_arming_failure_ms = AP_HAL::millis();
+#if HAL_LOGGER_FILE_CONTENTS_ENABLED
+        file_content_prepare_for_arming = true;
+#endif
+    }
 
     void set_vehicle_armed(bool armed_state);
     bool vehicle_is_armed() const { return _armed; }
@@ -555,13 +524,26 @@ private:
         const char *filename;
         char log_filename[16];
     };
-    struct {
+    struct FileContent {
+        void reset();
+        void remove_and_free(file_list *victim);
         struct file_list *head, *tail;
-        int fd;
-        uint16_t offset;
+        int fd{-1};
+        uint32_t offset;
+        bool fast;
+        uint8_t counter;
         HAL_Semaphore sem;
-    } file_content;
+    };
+    FileContent normal_file_content;
+    FileContent at_arm_file_content;
+
+    // protect this with a semaphore?
+    bool file_content_prepare_for_arming;
+
     void file_content_update(void);
+
+    void prepare_at_arming_sys_file_logging();
+
 #endif
     
     /* support for retrieving logs via mavlink: */
@@ -626,6 +608,10 @@ private:
 
     /* end support for retrieving logs via mavlink: */
 
+#if HAL_LOGGER_FILE_CONTENTS_ENABLED
+    void log_file_content(FileContent &file_content, const char *filename);
+    void file_content_update(FileContent &file_content);
+#endif
 };
 
 namespace AP {

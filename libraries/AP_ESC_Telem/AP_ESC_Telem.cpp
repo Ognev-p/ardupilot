@@ -365,12 +365,11 @@ void AP_ESC_Telem::update_rpm(const uint8_t esc_index, const uint16_t new_rpm, c
 #endif
 }
 
-// log ESC telemetry at 10Hz
 void AP_ESC_Telem::update()
 {
     AP_Logger *logger = AP_Logger::get_singleton();
 
-    // Push received telemtry data into the logging system
+    // Push received telemetry data into the logging system
     if (logger && logger->logging_enabled()) {
 
         for (uint8_t i = 0; i < ESC_TELEM_MAX_ESCS; i++) {
@@ -388,7 +387,7 @@ void AP_ESC_Telem::update()
                 //   voltage is in Volt
                 //   current is in Ampere
                 //   esc_temp is in centi-degrees Celsius
-                //   current_tot is in mili-Ampere hours
+                //   current_tot is in milli-Ampere hours
                 //   motor_temp is in centi-degrees Celsius
                 //   error_rate is in percentage
                 const struct log_Esc pkt{
